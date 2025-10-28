@@ -15,15 +15,15 @@ AlignConsecutiveAssignments: false
 AlignConsecutiveDeclarations: false
 #AlignEscapedNewlines: Left # Unknown to clang-format-4.0
 AlignOperands: true
-AlignTrailingComments: false
+#AlignTrailingComments: false
 AllowAllParametersOfDeclarationOnNextLine: false
 AllowShortBlocksOnASingleLine: false
 AllowShortCaseLabelsOnASingleLine: false
-AllowShortFunctionsOnASingleLine: None
+#AllowShortFunctionsOnASingleLine: None
 AllowShortIfStatementsOnASingleLine: false
 AllowShortLoopsOnASingleLine: false
 AlwaysBreakAfterDefinitionReturnType: None
-AlwaysBreakAfterReturnType: None
+#AlwaysBreakAfterReturnType: None
 AlwaysBreakBeforeMultilineStrings: false
 AlwaysBreakTemplateDeclarations: false
 BinPackArguments: true
@@ -45,20 +45,20 @@ BraceWrapping:
   #SplitEmptyRecord: true # Unknown to clang-format-4.0
   #SplitEmptyNamespace: true # Unknown to clang-format-4.0
 BreakBeforeBinaryOperators: None
-BreakBeforeBraces: Custom
+#BreakBeforeBraces: Custom
 #BreakBeforeInheritanceComma: false # Unknown to clang-format-4.0
 BreakBeforeTernaryOperators: false
 BreakConstructorInitializersBeforeComma: false
 #BreakConstructorInitializers: BeforeComma # Unknown to clang-format-4.0
 BreakAfterJavaFieldAnnotations: false
 BreakStringLiterals: false
-ColumnLimit: 80
+#ColumnLimit: 80
 CommentPragmas: '^ IWYU pragma:'
 #CompactNamespaces: false # Unknown to clang-format-4.0
-ConstructorInitializerAllOnOneLineOrOnePerLine: false
+#ConstructorInitializerAllOnOneLineOrOnePerLine: false
 ConstructorInitializerIndentWidth: 8
 ContinuationIndentWidth: 8
-Cpp11BracedListStyle: false
+#Cpp11BracedListStyle: false
 DerivePointerAlignment: false
 DisableFormat: false
 ExperimentalAutoDetectBinPacking: false
@@ -111,7 +111,7 @@ PenaltyExcessCharacter: 100
 PenaltyReturnTypeOnItsOwnLine: 60
 
 PointerAlignment: Right
-ReflowComments: false
+#ReflowComments: false
 SortIncludes: false
 #SortUsingDeclarations: false # Unknown to clang-format-4.0
 SpaceAfterCStyleCast: false
@@ -130,5 +130,19 @@ SpacesInParentheses: false
 SpacesInSquareBrackets: false
 Standard: Cpp03
 TabWidth: 8
-UseTab: Always
+#UseTab: Always
+
+# Taken from Marvell CI rules
+BasedOnStyle: LLVM
+UseTab: ForContinuationAndIndentation
+ColumnLimit: 100
+AllowShortFunctionsOnASingleLine: false
+AlwaysBreakAfterReturnType: AllDefinitions
+ConstructorInitializerAllOnOneLineOrOnePerLine: true
+BreakBeforeBraces: Linux
+AlignEscapedNewlines: Right
+AlignConsecutiveMacros : true
+Cpp11BracedListStyle : true
+AlignTrailingComments : true
+ReflowComments: true
 ...
