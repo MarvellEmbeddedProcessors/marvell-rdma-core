@@ -162,12 +162,12 @@ struct octep_rdma_av {
 };
 
 struct octep_rdma_sge {
+	__aligned_le64 addr;
 	__le32 length;
 	__le32 key;
-	__aligned_le64 addr;
 };
 
-struct octep_rdma_sqe {
+union octep_rdma_sqe {
 	struct {
 		/* WORD 0 */
 		uint8_t opcode;
@@ -197,7 +197,7 @@ struct octep_rdma_sqe {
 	struct octep_rdma_sge sges1[4];
 };
 
-struct octep_rdma_rqe {
+union octep_rdma_rqe {
 	struct {
 		/* WORD 0 */
 		uint32_t flags;

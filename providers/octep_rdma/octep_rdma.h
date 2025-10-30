@@ -18,8 +18,13 @@
 #define OCTEP_RDMA_QP_TABLE_SIZE  4096
 #define OCTEP_RDMA_QP_TABLE_SHIFT 12
 #define OCTEP_RDMA_QP_TABLE_MASK  0xFFF
+#define OCTEP_RDMA_QS_MULTIPLIER  3
+/* TODO Get from mbox */
+#define OCTEP_RDMA_OFF_MULTIPLIER (64UL * 1024)
 
 #define OCTEP_RDMA_MAX_WQE_PER_SQE 64
+#define OCTEP_MIN(a, b)            ((a) < (b) ? (a) : (b))
+#define octep_always_inline        __always_inline
 
 struct octep_rdma_dev {
 	struct verbs_device ibv_dev;

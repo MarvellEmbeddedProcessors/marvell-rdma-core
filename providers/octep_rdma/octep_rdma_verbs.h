@@ -17,8 +17,12 @@ struct octep_rdma_cq {
 	uint32_t event_stats;
 
 	uint32_t depth;
+	uint32_t qmask;
 	uint32_t ci;
-	struct octep_rdma_cqe *queue;
+	void *q_base;
+	volatile atomic_ushort *pi_dbl;
+	volatile atomic_ushort *ci_dbl;
+
 	uint32_t cq_size;
 	uint32_t comp_vector;
 
@@ -28,13 +32,15 @@ struct octep_rdma_cq {
 struct octep_rdma_queue {
 	void *qbuf;
 	void *db;
+	volatile atomic_ushort *pi_dbl;
+	volatile atomic_ushort *ci_dbl;
 
 	uint16_t rsvd0;
 	uint16_t depth;
+	uint16_t qmask;
 	uint32_t size;
 
 	uint16_t pi;
-	uint16_t ci;
 
 	uint32_t rsvd1;
 	uint64_t *wr_tbl;
@@ -66,6 +72,7 @@ struct octep_rdma_ah {
 	int ah_num;
 };
 
+extern struct verbs_context_ops octep_rdma_pts_ctx_ops;
 int octep_rdma_query_device(struct ibv_context *ctx, const struct ibv_query_device_ex_input *input,
 			    struct ibv_device_attr_ex *attr, size_t attr_size);
 int octep_rdma_query_port(struct ibv_context *ctx, uint8_t port, struct ibv_port_attr *attr);
@@ -78,6 +85,7 @@ struct ibv_cq *octep_rdma_create_cq(struct ibv_context *ctx, int num_cqe,
 				    struct ibv_comp_channel *channel, int comp_vector);
 int octep_rdma_destroy_cq(struct ibv_cq *base_cq);
 int octep_rdma_poll_cq(struct ibv_cq *ibcq, int num_entries, struct ibv_wc *wc);
+void octep_rdma_free_context(struct ibv_context *ibv_ctx);
 
 struct ibv_qp *octep_rdma_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *attr);
 int octep_rdma_modify_qp(struct ibv_qp *base_qp, struct ibv_qp_attr *attr, int attr_mask);
@@ -90,4 +98,9 @@ int octep_rdma_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr_list,
 			 struct ibv_send_wr **bad_wr);
 int octep_rdma_post_recv(struct ibv_qp *base_qp, struct ibv_recv_wr *wr,
 			 struct ibv_recv_wr **bad_wr);
+int octep_rdma_pts_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr_list,
+			     struct ibv_send_wr **bad_wr);
+int octep_rdma_pts_post_recv(struct ibv_qp *base_qp, struct ibv_recv_wr *wr,
+			     struct ibv_recv_wr **bad_wr);
+int octep_rdma_pts_poll_cq(struct ibv_cq *ibcq, int num_entries, struct ibv_wc *wc);
 #endif /* __OCTEP_RDMA_VERBS_H__ */

@@ -122,33 +122,34 @@ octep_rdma_alloc_buf(struct octep_rdma_cq *cq, unsigned int cq_size, int page_si
 	int ret = 0;
 
 	cq->cq_size = align(cq_size, page_size);
-	cq->queue =
+	cq->q_base =
 		mmap(NULL, cq->cq_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-	if (cq->queue == MAP_FAILED) {
+	if (cq->q_base == MAP_FAILED) {
 		verbs_err(verbs_get_ctx(cq->ibcq.context), "mmap failed, err %d\n", errno);
 		ret = errno;
 		goto err;
 	}
 	verbs_debug(verbs_get_ctx(cq->ibcq.context), "[%s] cq  %p cq size %d\n", __func__,
-		    cq->queue, cq->cq_size);
+		    cq->q_base, cq->cq_size);
 
-	ret = ibv_dontfork_range(cq->queue, cq->cq_size);
+	ret = ibv_dontfork_range(cq->q_base, cq->cq_size);
 	if (ret) {
 		verbs_err(verbs_get_ctx(cq->ibcq.context), "ibv_dontfork_range failed, err %d\n",
 			  ret);
-		munmap(cq->queue, cq->cq_size);
+		munmap(cq->q_base, cq->cq_size);
 		goto err;
 	}
 
-	memset(cq->queue, 0, cq_size);
+	memset(cq->q_base, 0, cq_size);
 err:
 	return ret;
 }
 
 struct ibv_cq *
-octep_rdma_create_cq(struct ibv_context *ctx, int num_cqe, struct ibv_comp_channel *channel,
+octep_rdma_create_cq(struct ibv_context *ibv_ctx, int num_cqe, struct ibv_comp_channel *channel,
 		     int comp_vector)
 {
+	struct octep_rdma_ctx *ctx = to_octep_rdma_ctx(ibv_ctx);
 	struct octep_rdma_cmd_create_cq_resp resp = {};
 	struct octep_rdma_cmd_create_cq cmd = {};
 	struct octep_rdma_cq *cq;
@@ -163,7 +164,7 @@ octep_rdma_create_cq(struct ibv_context *ctx, int num_cqe, struct ibv_comp_chann
 	if (num_cqe < 64)
 		num_cqe = 64;
 
-	cq->ibcq.context = ctx;
+	cq->ibcq.context = ibv_ctx;
 	num_cqe = roundup_pow_of_two(num_cqe);
 	cq_size = align(num_cqe * sizeof(struct octep_rdma_cqe), OCTEP_RDMA_PAGE_SIZE);
 
@@ -172,10 +173,10 @@ octep_rdma_create_cq(struct ibv_context *ctx, int num_cqe, struct ibv_comp_chann
 		goto err;
 	}
 
-	cmd.qbuf_va = (uintptr_t)cq->queue;
+	cmd.qbuf_va = (uintptr_t)cq->q_base;
 	cmd.qbuf_len = cq_size;
 
-	rv = ibv_cmd_create_cq(ctx, num_cqe, channel, comp_vector, &cq->ibcq, &cmd.ibv_cmd,
+	rv = ibv_cmd_create_cq(ibv_ctx, num_cqe, channel, comp_vector, &cq->ibcq, &cmd.ibv_cmd,
 			       sizeof(cmd), &resp.ibv_resp, sizeof(resp));
 	if (rv) {
 		errno = EIO;
@@ -186,18 +187,23 @@ octep_rdma_create_cq(struct ibv_context *ctx, int num_cqe, struct ibv_comp_chann
 
 	cq->id = resp.cq_id;
 	cq->depth = resp.num_cqe;
+	cq->qmask = cq->depth - 1;
 	cq->comp_vector = comp_vector;
+	cq->pi_dbl = (void *)ctx->db_region +
+		     (((cq->id * OCTEP_RDMA_QS_MULTIPLIER) + 2) * OCTEP_RDMA_OFF_MULTIPLIER);
+	cq->ci_dbl = cq->pi_dbl + 2;
 
 	verbs_debug(verbs_get_ctx(cq->ibcq.context),
-		    "[%s] cq %p cq->queue 0x%lx size %lx id %d depth %d comp_vector %d\n", __func__,
-		    cq, (uintptr_t)cq->queue, cq_size, cq->id, cq->depth, cq->comp_vector);
+		    "[%s] cq %p cq->q_base 0x%lx size %lx id %d depth %d comp_vector %d\n",
+		    __func__, cq, (uintptr_t)cq->q_base, cq_size, cq->id, cq->depth,
+		    cq->comp_vector);
 
 	return &cq->ibcq;
 
 error_alloc:
-	if (cq->queue) {
-		ibv_dofork_range(cq->queue, cq->cq_size);
-		munmap(cq->queue, cq->cq_size);
+	if (cq->q_base) {
+		ibv_dofork_range(cq->q_base, cq->cq_size);
+		munmap(cq->q_base, cq->cq_size);
 	}
 err:
 	free(cq);
@@ -220,9 +226,9 @@ octep_rdma_destroy_cq(struct ibv_cq *base_cq)
 	}
 	pthread_spin_destroy(&cq->lock);
 
-	if (cq->queue) {
-		ibv_dofork_range(cq->queue, cq->cq_size);
-		munmap(cq->queue, cq->cq_size);
+	if (cq->q_base) {
+		ibv_dofork_range(cq->q_base, cq->cq_size);
+		munmap(cq->q_base, cq->cq_size);
 	}
 
 	free(cq);
@@ -233,7 +239,7 @@ octep_rdma_destroy_cq(struct ibv_cq *base_cq)
 static int
 __octep_rdma_poll_one_cqe(struct octep_rdma_cq *cq, struct ibv_wc *wc)
 {
-	struct octep_rdma_cqe *cqe = &cq->queue[0];
+	struct octep_rdma_cqe *cqe = (struct octep_rdma_cqe *)cq->q_base;
 
 	if (!cqe) {
 		verbs_err(verbs_get_ctx(cq->ibcq.context), "Invalid CQ\n");
@@ -372,16 +378,16 @@ octep_rdma_alloc_qp_buf_and_db(struct octep_rdma_qp *qp, struct ibv_qp_init_attr
 	int rv;
 
 	num_sqe = roundup_pow_of_two(attr->cap.max_send_wr * OCTEP_RDMA_MAX_WQE_PER_SQE);
-	queue_size = align(num_sqe * sizeof(struct octep_rdma_sqe), page_size);
+	queue_size = align(num_sqe * sizeof(union octep_rdma_sqe), page_size);
 	verbs_debug(verbs_get_ctx(qp->ibqp.context),
 		    "SQE: queue_size %ld - num_sqe %d sizeof sqe %ld\n", queue_size, num_sqe,
-		    sizeof(struct octep_rdma_sqe));
+		    sizeof(union octep_rdma_sqe));
 
 	num_rqe = roundup_pow_of_two(attr->cap.max_recv_wr);
-	queue_size += align(num_rqe * sizeof(struct octep_rdma_rqe), page_size);
+	queue_size += align(num_rqe * sizeof(union octep_rdma_rqe), page_size);
 	verbs_debug(verbs_get_ctx(qp->ibqp.context),
 		    "RQE: queue_size %ld - num_rqe %d sizeof rqe %ld\n", queue_size, num_rqe,
-		    sizeof(struct octep_rdma_rqe));
+		    sizeof(union octep_rdma_rqe));
 
 	qp->qbuf_size = queue_size;
 	qp->qbuf = mmap(NULL, qp->qbuf_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS,
@@ -449,9 +455,11 @@ octep_rdma_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *attr)
 	qp->id = resp.qp_id;
 	qp->sq.depth = resp.num_sqe;
 	qp->rq.depth = resp.num_rqe;
+	qp->sq.qmask = qp->sq.depth - 1;
+	qp->rq.qmask = qp->rq.depth - 1;
 	qp->sq_sig_all = attr->sq_sig_all;
-	qp->sq.size = resp.num_sqe * sizeof(struct octep_rdma_sqe);
-	qp->rq.size = resp.num_rqe * sizeof(struct octep_rdma_rqe);
+	qp->sq.size = resp.num_sqe * sizeof(union octep_rdma_sqe);
+	qp->rq.size = resp.num_rqe * sizeof(union octep_rdma_rqe);
 
 	qp->sq.qbuf = qp->qbuf;
 	qp->rq.qbuf = qp->qbuf + resp.rq_offset;
@@ -466,6 +474,13 @@ octep_rdma_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *attr)
 	pthread_spin_init(&qp->rq_lock, PTHREAD_PROCESS_PRIVATE);
 
 	qp->db_region = ctx->db_region;
+	qp->sq.pi_dbl =
+		qp->db_region + ((qp->id * OCTEP_RDMA_QS_MULTIPLIER) * OCTEP_RDMA_OFF_MULTIPLIER);
+	qp->sq.ci_dbl = qp->sq.pi_dbl + 2;
+
+	qp->rq.pi_dbl = qp->db_region +
+			(((qp->id * OCTEP_RDMA_QS_MULTIPLIER) + 1) * OCTEP_RDMA_OFF_MULTIPLIER);
+	qp->rq.ci_dbl = qp->rq.pi_dbl + 2;
 	rv = octep_rdma_alloc_wrid_tbl(qp);
 	if (rv) {
 		verbs_err(verbs_get_ctx(pd->context),
@@ -487,7 +502,7 @@ err_sendq:
 	ibv_cmd_destroy_qp(&qp->ibqp);
 err_cmd:
 	ibv_dofork_range(qp->qbuf, qp->qbuf_size);
-	free(qp->qbuf);
+	munmap(qp->qbuf, qp->qbuf_size);
 err:
 	free(qp);
 
@@ -618,7 +633,7 @@ map_send_flags(int ibv_flags)
 }
 
 static inline int
-push_send_wqe(struct ibv_qp *ibqp, struct ibv_send_wr *base_wr, struct octep_rdma_sqe *sqe,
+push_send_wqe(struct ibv_qp *ibqp, struct ibv_send_wr *base_wr, union octep_rdma_sqe *sqe,
 	      int sig_all)
 {
 	uint32_t flags = map_send_flags(base_wr->send_flags);
@@ -745,7 +760,7 @@ octep_rdma_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr_list, struct ib
 	sq_pi = qp->sq.pi;
 	while (wr_list) {
 		idx = sq_pi % qp->sq.depth;
-		struct octep_rdma_sqe *sqe = (struct octep_rdma_sqe *)(qp->sq.qbuf) + idx;
+		union octep_rdma_sqe *sqe = (union octep_rdma_sqe *)(qp->sq.qbuf) + idx;
 		uint16_t sqe_flags;
 
 		fp = (atomic_ushort *)&sqe->flags;
@@ -811,7 +826,7 @@ post_recv_db(struct ibv_qp *ibqp)
 }
 
 static inline int
-push_recv_wqe(struct ibv_recv_wr *base_wr, struct octep_rdma_rqe *rqe)
+push_recv_wqe(struct ibv_recv_wr *base_wr, union octep_rdma_rqe *rqe)
 {
 	atomic_ushort *fp = (atomic_ushort *)&rqe->flags;
 
@@ -847,7 +862,7 @@ octep_rdma_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr, struct ibv_rec
 
 	while (wr) {
 		int idx = rq_pi % qp->rq.depth;
-		struct octep_rdma_rqe *rqe = (struct octep_rdma_rqe *)(qp->rq.qbuf) + idx;
+		union octep_rdma_rqe *rqe = (union octep_rdma_rqe *)(qp->rq.qbuf) + idx;
 		atomic_ushort *fp = (atomic_ushort *)&rqe->flags;
 		uint16_t rqe_flags = atomic_load(fp);
 

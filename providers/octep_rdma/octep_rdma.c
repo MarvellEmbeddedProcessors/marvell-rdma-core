@@ -12,7 +12,7 @@
 #include "octep_rdma.h"
 #include "octep_rdma_hw.h"
 
-static void
+void
 octep_rdma_free_context(struct ibv_context *ibv_ctx)
 {
 	struct octep_rdma_ctx *ctx = to_octep_rdma_ctx(ibv_ctx);
@@ -55,6 +55,7 @@ octep_rdma_alloc_context(struct ibv_device *ibv_dev, int cmd_fd, void *private_d
 	struct octep_rdma_cmd_alloc_context_resp resp = {};
 	struct octep_rdma_ctx *ctx;
 	struct ibv_get_context cmd;
+	char *env;
 
 	ctx = verbs_init_and_alloc_context(ibv_dev, cmd_fd, ctx, ibv_ctx, RDMA_DRIVER_OCTEP);
 	if (!ctx)
@@ -81,6 +82,12 @@ octep_rdma_alloc_context(struct ibv_device *ibv_dev, int cmd_fd, void *private_d
 
 	verbs_set_ops(&ctx->ibv_ctx, &octep_rdma_ctx_ops);
 
+	/* Default to transport verbs */
+	env = getenv("OCTEON_TRANSPORT_VERBS");
+	if (!env || !strcmp(env, "0")) {
+		verbs_set_ops(&ctx->ibv_ctx, &octep_rdma_pts_ctx_ops);
+		verbs_info(&ctx->ibv_ctx, "Enabled Transport FP verbs\n");
+	}
 	return &ctx->ibv_ctx;
 fail:
 	verbs_uninit_context(&ctx->ibv_ctx);
