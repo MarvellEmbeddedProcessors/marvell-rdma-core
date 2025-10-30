@@ -19,8 +19,6 @@
 #define OCTEP_RDMA_QP_TABLE_SHIFT 12
 #define OCTEP_RDMA_QP_TABLE_MASK  0xFFF
 #define OCTEP_RDMA_QS_MULTIPLIER  3
-/* TODO Get from mbox */
-#define OCTEP_RDMA_OFF_MULTIPLIER (64UL * 1024)
 
 #define OCTEP_RDMA_MAX_WQE_PER_SQE 64
 #define OCTEP_MIN(a, b)            ((a) < (b) ? (a) : (b))
@@ -39,6 +37,7 @@ struct octep_rdma_ctx {
 	} qp_table[OCTEP_RDMA_QP_TABLE_SIZE];
 	pthread_mutex_t qp_table_mutex;
 	uint32_t page_size;
+	uint32_t notify_off_multiplier;
 	uint64_t *db_region;
 	uint64_t db_region_sz;
 };

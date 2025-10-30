@@ -7,7 +7,11 @@
 
 #include "octep_rdma-abi.h"
 
-#define SQEBB_SHIFT 5
+#define SQEBB_SHIFT            5
+#define OCTEP_RDMA_MAX_SEND_WR 8192
+#define OCTEP_RDMA_MAX_RECV_WR 8192
+#define OCTEP_RDMA_MIN_SEND_WR 64
+#define OCTEP_RDMA_MIN_RECV_WR 64
 
 struct octep_rdma_cq {
 	struct ibv_cq ibcq;

@@ -70,7 +70,7 @@ enum octep_rdma_opcode {
 
 struct octep_rdma_uresp_alloc_ctx {
 	__u32 dev_id;
-	__u32 pad;
+	__u32 notify_off_multiplier;
 	__aligned_u64 db_region;
 	__aligned_u64 db_region_sz;
 };
@@ -95,13 +95,13 @@ struct octep_rdma_ureq_create_qp {
 	__aligned_u64 db_record_va;
 	__aligned_u64 qbuf_va;
 	__u32 qbuf_len;
+	__u32 num_sqe;
+	__u32 num_rqe;
 	__u32 rsvd0;
 };
 
 struct octep_rdma_uresp_create_qp {
 	__u32 qp_id;
-	__u32 num_sqe;
-	__u32 num_rqe;
 	__u32 rq_offset;
 	__aligned_u64 sq_key;
 	__aligned_u64 rq_key;

@@ -165,7 +165,7 @@ octep_rdma_create_cq(struct ibv_context *ibv_ctx, int num_cqe, struct ibv_comp_c
 		num_cqe = 64;
 
 	cq->ibcq.context = ibv_ctx;
-	num_cqe = roundup_pow_of_two(num_cqe);
+	num_cqe = roundup_pow_of_two(num_cqe + 1);
 	cq_size = align(num_cqe * sizeof(struct octep_rdma_cqe), OCTEP_RDMA_PAGE_SIZE);
 
 	if (octep_rdma_alloc_buf(cq, cq_size, OCTEP_RDMA_PAGE_SIZE)) {
@@ -175,6 +175,7 @@ octep_rdma_create_cq(struct ibv_context *ibv_ctx, int num_cqe, struct ibv_comp_c
 
 	cmd.qbuf_va = (uintptr_t)cq->q_base;
 	cmd.qbuf_len = cq_size;
+	num_cqe--;
 
 	rv = ibv_cmd_create_cq(ibv_ctx, num_cqe, channel, comp_vector, &cq->ibcq, &cmd.ibv_cmd,
 			       sizeof(cmd), &resp.ibv_resp, sizeof(resp));
@@ -190,7 +191,7 @@ octep_rdma_create_cq(struct ibv_context *ibv_ctx, int num_cqe, struct ibv_comp_c
 	cq->qmask = cq->depth - 1;
 	cq->comp_vector = comp_vector;
 	cq->pi_dbl = (void *)ctx->db_region +
-		     (((cq->id * OCTEP_RDMA_QS_MULTIPLIER) + 2) * OCTEP_RDMA_OFF_MULTIPLIER);
+		     (((cq->id * OCTEP_RDMA_QS_MULTIPLIER) + 2) * ctx->notify_off_multiplier);
 	cq->ci_dbl = cq->pi_dbl + 2;
 
 	verbs_debug(verbs_get_ctx(cq->ibcq.context),
@@ -377,13 +378,23 @@ octep_rdma_alloc_qp_buf_and_db(struct octep_rdma_qp *qp, struct ibv_qp_init_attr
 	size_t queue_size;
 	int rv;
 
-	num_sqe = roundup_pow_of_two(attr->cap.max_send_wr * OCTEP_RDMA_MAX_WQE_PER_SQE);
+	num_sqe = roundup_pow_of_two(attr->cap.max_send_wr + 1);
+	if (num_sqe < OCTEP_RDMA_MIN_SEND_WR)
+		num_sqe = OCTEP_RDMA_MIN_SEND_WR;
+	else if (num_sqe > OCTEP_RDMA_MAX_SEND_WR)
+		num_sqe = OCTEP_RDMA_MAX_SEND_WR;
+
 	queue_size = align(num_sqe * sizeof(union octep_rdma_sqe), page_size);
 	verbs_debug(verbs_get_ctx(qp->ibqp.context),
 		    "SQE: queue_size %ld - num_sqe %d sizeof sqe %ld\n", queue_size, num_sqe,
 		    sizeof(union octep_rdma_sqe));
 
-	num_rqe = roundup_pow_of_two(attr->cap.max_recv_wr);
+	num_rqe = roundup_pow_of_two(attr->cap.max_recv_wr + 1);
+	if (num_rqe < OCTEP_RDMA_MIN_RECV_WR)
+		num_rqe = OCTEP_RDMA_MIN_RECV_WR;
+	else if (num_rqe > OCTEP_RDMA_MAX_RECV_WR)
+		num_rqe = OCTEP_RDMA_MAX_RECV_WR;
+
 	queue_size += align(num_rqe * sizeof(union octep_rdma_rqe), page_size);
 	verbs_debug(verbs_get_ctx(qp->ibqp.context),
 		    "RQE: queue_size %ld - num_rqe %d sizeof rqe %ld\n", queue_size, num_rqe,
@@ -403,6 +414,8 @@ octep_rdma_alloc_qp_buf_and_db(struct octep_rdma_qp *qp, struct ibv_qp_init_attr
 		errno = rv;
 		goto err_dontfork;
 	}
+	qp->sq.depth = num_sqe;
+	qp->rq.depth = num_rqe;
 
 	return 0;
 err_dontfork:
@@ -440,6 +453,8 @@ octep_rdma_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *attr)
 
 	cmd.qbuf_va = (uintptr_t)qp->qbuf;
 	cmd.qbuf_len = qp->qbuf_size;
+	cmd.num_sqe = qp->sq.depth;
+	cmd.num_rqe = qp->rq.depth;
 	rv = ibv_cmd_create_qp(pd, &qp->ibqp, attr, &cmd.ibv_cmd, sizeof(cmd), &resp.ibv_resp,
 			       sizeof(resp));
 	if (rv) {
@@ -453,13 +468,11 @@ octep_rdma_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *attr)
 
 	qp->type = attr->qp_type;
 	qp->id = resp.qp_id;
-	qp->sq.depth = resp.num_sqe;
-	qp->rq.depth = resp.num_rqe;
 	qp->sq.qmask = qp->sq.depth - 1;
 	qp->rq.qmask = qp->rq.depth - 1;
 	qp->sq_sig_all = attr->sq_sig_all;
-	qp->sq.size = resp.num_sqe * sizeof(union octep_rdma_sqe);
-	qp->rq.size = resp.num_rqe * sizeof(union octep_rdma_rqe);
+	qp->sq.size = qp->sq.depth * sizeof(union octep_rdma_sqe);
+	qp->rq.size = qp->rq.depth * sizeof(union octep_rdma_rqe);
 
 	qp->sq.qbuf = qp->qbuf;
 	qp->rq.qbuf = qp->qbuf + resp.rq_offset;
@@ -467,19 +480,20 @@ octep_rdma_create_qp(struct ibv_pd *pd, struct ibv_qp_init_attr *attr)
 		    "[%s] qp->sq.qbuf %p qp->rq.qbuf %p rq_offset %d\n", __func__, qp->sq.qbuf,
 		    qp->rq.qbuf, resp.rq_offset);
 
-	verbs_debug(verbs_get_ctx(pd->context), "[%s] num sqe %d sq size %d rq size %d\n", __func__,
-		    qp->sq.depth, qp->sq.size, qp->rq.size);
+	verbs_debug(verbs_get_ctx(pd->context),
+		    "[%s] num sqe %d num_rqe %d sq size %d rq size %d\n", __func__, qp->sq.depth,
+		    qp->rq.depth, qp->sq.size, qp->rq.size);
 
 	pthread_spin_init(&qp->sq_lock, PTHREAD_PROCESS_PRIVATE);
 	pthread_spin_init(&qp->rq_lock, PTHREAD_PROCESS_PRIVATE);
 
 	qp->db_region = ctx->db_region;
 	qp->sq.pi_dbl =
-		qp->db_region + ((qp->id * OCTEP_RDMA_QS_MULTIPLIER) * OCTEP_RDMA_OFF_MULTIPLIER);
+		qp->db_region + ((qp->id * OCTEP_RDMA_QS_MULTIPLIER) * ctx->notify_off_multiplier);
 	qp->sq.ci_dbl = qp->sq.pi_dbl + 2;
 
 	qp->rq.pi_dbl = qp->db_region +
-			(((qp->id * OCTEP_RDMA_QS_MULTIPLIER) + 1) * OCTEP_RDMA_OFF_MULTIPLIER);
+			(((qp->id * OCTEP_RDMA_QS_MULTIPLIER) + 1) * ctx->notify_off_multiplier);
 	qp->rq.ci_dbl = qp->rq.pi_dbl + 2;
 	rv = octep_rdma_alloc_wrid_tbl(qp);
 	if (rv) {
