@@ -167,7 +167,7 @@ octep_rdma_pts_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr, struct ibv
 		wr = wr->next;
 	}
 	rq->pi = pi;
-	__atomic_store((uint16_t *)rq->pi_dbl, &rq->pi, __ATOMIC_RELAXED);
+	__atomic_store((uint16_t *)rq->pi_dbl, &rq->pi, __ATOMIC_RELEASE);
 	pthread_spin_unlock(&qp->rq_lock);
 	return rv;
 }
