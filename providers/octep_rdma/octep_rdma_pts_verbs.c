@@ -39,6 +39,7 @@ struct verbs_context_ops octep_rdma_pts_ctx_ops = {
 	.post_send = octep_rdma_pts_post_send,
 	.post_recv = octep_rdma_pts_post_recv,
 	.poll_cq = octep_rdma_pts_poll_cq,
+	.req_notify_cq = ibv_cmd_req_notify_cq,
 };
 
 static octep_always_inline bool
@@ -102,6 +103,8 @@ octep_rdma_pts_poll_cq(struct ibv_cq *ibcq, int num_entries, struct ibv_wc *wc)
 		wc[i].byte_len = cqe->byte_len;
 		wc[i].vendor_err = cqe->vendor_err;
 		wc[i].qp_num = cqe->qp_id;
+		wc[i].wc_flags = IBV_WC_GRH;
+		wc[i].imm_data = cqe->imm_data;
 		ci = (ci + 1) & qmask;
 	}
 	/* Update consumer index */

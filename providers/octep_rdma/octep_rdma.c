@@ -75,8 +75,6 @@ octep_rdma_alloc_context(struct ibv_device *ibv_dev, int cmd_fd, void *private_d
 		goto fail;
 	}
 
-	/* Clear the doorbell region */
-	memset(ctx->db_region, 0, ctx->db_region_sz);
 	ctx->dev_id = resp.dev_id;
 	ctx->page_size = OCTEP_RDMA_PAGE_SIZE;
 	ctx->notify_off_multiplier = resp.notify_off_multiplier;

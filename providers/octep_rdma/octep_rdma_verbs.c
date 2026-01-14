@@ -140,7 +140,7 @@ octep_rdma_alloc_buf(struct octep_rdma_cq *cq, unsigned int cq_size, int page_si
 		goto err;
 	}
 
-	memset(cq->q_base, 0, cq_size);
+	memset(cq->q_base, 0, cq->cq_size);
 err:
 	return ret;
 }
