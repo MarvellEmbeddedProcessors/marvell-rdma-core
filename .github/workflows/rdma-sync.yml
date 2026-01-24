@@ -1,4 +1,4 @@
-name: DAO-Sync
+name: RDMA-Sync
 
 on:
   pull_request:
