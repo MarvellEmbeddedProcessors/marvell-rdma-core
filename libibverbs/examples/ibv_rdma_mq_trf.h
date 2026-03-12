@@ -49,6 +49,23 @@ struct qp_info {
 	union ibv_gid gid;
 };
 
+struct qp_stats {
+	uint64_t send_wr_posted;
+	uint64_t recv_wr_posted;
+	uint64_t send_cqe_ok;
+	uint64_t recv_cqe_ok;
+	uint64_t cqe_err;
+	uint64_t send_wr_failed;
+	uint64_t recv_wr_failed;
+};
+
+struct qp_stats_record {
+	struct qp_stats stats;
+	uint32_t qp_num;
+	int dir;
+	bool valid;
+};
+
 struct qp_data {
 	struct ibv_qp *qp;
 	struct ibv_cq *cq;
@@ -60,15 +77,16 @@ struct qp_data {
 	int pending;
 	int csock;
 	int init;
-	struct device_ctx *dev; // Direct pointer to device context
+	struct device_ctx *dev;
 	int rcnt;
 	int dir;
 	void **buf_arr;
 	struct ibv_mr **mr_arr;
 	int delete_me;
-	int armed;                  // 1 when QP/CQ are fully ready and safe to poll
-	uint64_t send_posted_count; // number of sends posted (for signaled interval)
-	int pending_echo_count;     // tracks expected echoes in pingpong mode
+	int armed;
+	uint64_t send_posted_count;
+	int pending_echo_count;
+	struct qp_stats stats;
 };
 
 struct app_ctx {
@@ -105,8 +123,9 @@ struct app_ctx {
 	int max_send_wr;   // SQ depth
 	int signal_every;  // signal every N sends (1 = signal all)
 	int inline_thresh; // inline threshold in bytes (0 = disabled)
-	int total_slots;   // total QP slots managed by workers
-	bool pingpong;     // if true, only SEND after RECV (classic ping-pong)
+	int total_slots;
+	bool pingpong;
+	bool stats_enabled;
 };
 
 #define MAX_CLIENTS 2048
