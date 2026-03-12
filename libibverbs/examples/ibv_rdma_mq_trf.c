@@ -579,7 +579,6 @@ rdma_cleanup(struct qp_data *qdata)
 {
 	printf("Cleaning up QP %u device cleanup\n", qdata->local_info.qp_num);
 
-	// Disarm to stop any polling threads from touching cq/qp
 	qdata->armed = 0;
 
 	struct ibv_qp *qp = qdata->qp;
@@ -587,6 +586,21 @@ rdma_cleanup(struct qp_data *qdata)
 
 	qdata->qp = NULL;
 	qdata->cq = NULL;
+
+	if (qp) {
+		struct ibv_qp_attr attr = {.qp_state = IBV_QPS_ERR};
+
+		if (ibv_modify_qp(qp, &attr, IBV_QP_STATE))
+			printf("Warning: failed to move QP %u to ERROR state\n",
+			       qdata->local_info.qp_num);
+	}
+
+	if (cq) {
+		struct ibv_wc wc;
+
+		while (ibv_poll_cq(cq, 1, &wc) > 0)
+			;
+	}
 
 	if (qp && ibv_destroy_qp(qp)) {
 		printf("Couldn't destroy QP\n");
