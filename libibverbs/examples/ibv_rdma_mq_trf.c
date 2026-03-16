@@ -253,6 +253,7 @@ usage(const char *argv0)
 	printf("  --pingpong          For SEND: only SEND after a RECV (default on)\n");
 	printf("  --no-pingpong       Disable ping-pong; allow SEND when idle\n");
 	printf("  --stats             Enable per-QP statistics; dump to file on exit\n");
+	printf("  --separate-cq       Use separate CQs for SQ and RQ (default: shared CQ)\n");
 }
 
 static inline void
@@ -286,6 +287,7 @@ rdma_init_default(void)
 	g_ctx.inline_thresh = 0;
 	g_ctx.pingpong = true;
 	g_ctx.stats_enabled = false;
+	g_ctx.separate_cq = false;
 }
 
 /* Pick a valid (non-zero) GID index for the given device/port if none was provided. */
@@ -588,9 +590,11 @@ rdma_cleanup(struct qp_data *qdata)
 
 	struct ibv_qp *qp = qdata->qp;
 	struct ibv_cq *cq = qdata->cq;
+	struct ibv_cq *scq = qdata->send_cq;
 
 	qdata->qp = NULL;
 	qdata->cq = NULL;
+	qdata->send_cq = NULL;
 
 	if (qp) {
 		struct ibv_qp_attr attr = {.qp_state = IBV_QPS_ERR};
@@ -606,6 +610,12 @@ rdma_cleanup(struct qp_data *qdata)
 		while (ibv_poll_cq(cq, 1, &wc) > 0)
 			;
 	}
+	if (scq) {
+		struct ibv_wc wc;
+
+		while (ibv_poll_cq(scq, 1, &wc) > 0)
+			;
+	}
 
 	if (qp && ibv_destroy_qp(qp)) {
 		printf("Couldn't destroy QP\n");
@@ -614,6 +624,10 @@ rdma_cleanup(struct qp_data *qdata)
 
 	if (cq && ibv_destroy_cq(cq)) {
 		printf("Couldn't destroy CQ\n");
+		return -1;
+	}
+	if (scq && ibv_destroy_cq(scq)) {
+		printf("Couldn't destroy send CQ\n");
 		return -1;
 	}
 
@@ -841,14 +855,22 @@ rdma_mq_init(int csock, struct device_ctx *dev)
 		data->dir = g_ctx.dir;
 
 		data->cq = ibv_create_cq(dev->dev_ctx, g_ctx.rx_depth + 1, NULL, NULL, 0);
-		if (g_ctx.debug) {
-			printf("[DEBUG] Created CQ %p (rx_depth %u) on dev %s\n", (void *)data->cq,
-			       g_ctx.rx_depth + 1, dev->ib_devname);
-		}
 		if (!data->cq) {
 			printf("CQ create failed for thread\n");
 			goto cleanup;
 		}
+		if (g_ctx.separate_cq) {
+			data->send_cq =
+				ibv_create_cq(dev->dev_ctx, g_ctx.max_send_wr + 1, NULL, NULL, 0);
+			if (!data->send_cq) {
+				printf("Send CQ create failed for thread\n");
+				goto cleanup;
+			}
+		}
+		if (g_ctx.debug)
+			printf("[DEBUG] Created %s CQ on dev %s\n",
+			       g_ctx.separate_cq ? "separate send+recv" : "shared",
+			       dev->ib_devname);
 
 		data->buf_arr = calloc(g_ctx.nb_sge, sizeof(void *));
 		data->mr_arr = calloc(g_ctx.nb_sge, sizeof(struct ibv_mr *));
@@ -883,7 +905,7 @@ rdma_mq_init(int csock, struct device_ctx *dev)
 
 		data->mr = data->mr_arr[0];
 
-		attr.send_cq = data->cq;
+		attr.send_cq = data->send_cq ? data->send_cq : data->cq;
 		attr.recv_cq = data->cq;
 		attr.cap.max_send_wr = g_ctx.max_send_wr;
 		attr.cap.max_recv_wr = g_ctx.rx_depth;
@@ -1016,7 +1038,9 @@ rdma_mq_init(int csock, struct device_ctx *dev)
 			}
 		}
 
-		data->pending = g_ctx.op_type == IBV_WR_SEND ? RDMA_UD_RECV : 0;
+		data->pending = (g_ctx.op_type == IBV_WR_SEND && data->dir != RDMA_UD_SEND) ?
+					RDMA_UD_RECV :
+					0;
 		data->rcnt = j;
 		data->init = 0;
 		data->num_pkt = g_ctx.num_pkts;
@@ -1052,8 +1076,6 @@ post_send(struct qp_data *qdata, int wr_id, int opcode)
 	struct ibv_send_wr send_wr = {0};
 	struct ibv_send_wr *bad_send;
 
-	if (g_ctx.num_pkt_set)
-		--qdata->num_pkt;
 	for (int sge_idx = 0; sge_idx < g_ctx.nb_sge; ++sge_idx) {
 		send_sge_arr[sge_idx].addr = (uintptr_t)qdata->buf_arr[sge_idx] + 40;
 		send_sge_arr[sge_idx].length = g_ctx.msg_size;
@@ -1091,6 +1113,8 @@ post_send(struct qp_data *qdata, int wr_id, int opcode)
 		return -1;
 	}
 	qdata->stats.send_wr_posted++;
+	if (g_ctx.num_pkt_set && qdata->num_pkt > 0)
+		--qdata->num_pkt;
 	if (g_ctx.debug)
 		printf("[DEBUG] Posted %s on QP %u (wr_id=%d)\n",
 		       (opcode == IBV_WR_SEND      ? "SEND" :
@@ -1120,31 +1144,55 @@ rdma_post_echo_send(struct qp_data *qdata, int tindex)
 static inline int
 rdma_handle_rdma_send(struct qp_data *qdata, int tindex)
 {
-	struct ibv_wc wc[2];
+	struct ibv_wc wc[16];
 	int ne, i, j;
 
 	static __thread uint64_t dbg_ticks;
 
-	if (qdata->armed == 0 || qdata->cq == NULL || qdata->qp == NULL) {
+	if (qdata->armed == 0 || qdata->cq == NULL || qdata->qp == NULL ||
+	    (g_ctx.separate_cq && qdata->send_cq == NULL)) {
 		if (g_ctx.debug)
 			printf("[DEBUG][T:%d] Skipping QP with null cq/qp (qid unknown)\n", tindex);
 		return 0;
 	}
 
-	if ((g_ctx.servername && qdata->init == 0 && qdata->dir == RDMA_UD_SEND_RECV) ||
-	    qdata->dir == RDMA_UD_SEND) {
+	if (g_ctx.servername && qdata->init == 0 && qdata->dir == RDMA_UD_SEND_RECV) {
 		if (post_send(qdata, RDMA_UD_SEND, IBV_WR_SEND)) {
 			printf("Error posting send for QP %u\n", qdata->local_info.qp_num);
 			return -1;
 		}
 		qdata->init = 1;
 		qdata->pending |= RDMA_UD_SEND;
-		/* Client expects echo for this initiated send */
 		if (g_ctx.pingpong && g_ctx.qp_type == IBV_QPT_RC && g_ctx.op_type == IBV_WR_SEND)
 			qdata->pending_echo_count++;
+	} else if (qdata->dir == RDMA_UD_SEND && qdata->init == 0) {
+		if (post_send(qdata, RDMA_UD_SEND, IBV_WR_SEND) == 0) {
+			qdata->init = 1;
+			qdata->pending |= RDMA_UD_SEND;
+			if (g_ctx.pingpong && g_ctx.qp_type == IBV_QPT_RC &&
+			    g_ctx.op_type == IBV_WR_SEND)
+				qdata->pending_echo_count++;
+		}
 	}
 
-	ne = ibv_poll_cq(qdata->cq, 2, wc);
+	/* Poll send CQ first to clear pending before processing recv CQEs */
+	if (qdata->send_cq) {
+		int sne = ibv_poll_cq(qdata->send_cq, 16, wc);
+
+		if (sne < 0) {
+			printf("poll send CQ failed %d\n", sne);
+			return -1;
+		}
+		for (i = 0; i < sne; i++) {
+			if (wc[i].status == IBV_WC_SUCCESS)
+				qdata->stats.send_cqe_ok++;
+			else
+				qdata->stats.cqe_err++;
+			qdata->pending &= ~(int)wc[i].wr_id;
+		}
+	}
+
+	ne = ibv_poll_cq(qdata->cq, 16, wc);
 	if (ne < 0) {
 		printf("poll CQ failed %d\n", ne);
 		return -1;
@@ -1155,52 +1203,68 @@ rdma_handle_rdma_send(struct qp_data *qdata, int tindex)
 			       tindex, qdata->local_info.qp_num, qdata->pending, qdata->rcnt);
 	}
 
+	/*
+	 * Two-pass CQE processing: first handle SEND completions to clear
+	 * the pending flag, then handle RECV completions which may need to
+	 * post echo sends. This avoids lost echoes when a RECV CQE appears
+	 * before a SEND CQE in the same poll batch.
+	 */
 	for (i = 0; i < ne; i++) {
-		if (wc[i].status == IBV_WC_SUCCESS && wc[i].wr_id == RDMA_UD_RECV) {
-			qdata->stats.recv_cqe_ok++;
-			qdata->rcnt--;
-
-			if (g_ctx.servername && g_ctx.pingpong && g_ctx.qp_type == IBV_QPT_RC &&
-			    g_ctx.op_type == IBV_WR_SEND && qdata->pending_echo_count > 0)
-				qdata->pending_echo_count--;
-
-			if (qdata->rcnt < g_ctx.rx_thold) {
-				int n = g_ctx.rx_depth - qdata->rcnt - 1;
-
-				j = post_recv(qdata, n, RDMA_UD_RECV);
-				if (j == 0) {
-					qdata->pending &= ~(int)wc[i].wr_id;
-					return 0;
-				}
-			}
-
-			if (g_ctx.pingpong && g_ctx.qp_type == IBV_QPT_RC &&
-			    g_ctx.op_type == IBV_WR_SEND && (qdata->dir != RDMA_UD_RECV) &&
-			    (!g_ctx.num_pkt_set || qdata->num_pkt)) {
-				if (qdata->pending & RDMA_UD_SEND) {
-					if (g_ctx.debug)
-						printf("[DEBUG][T:%d] Skipping SEND-on-RECV on QP %u (SEND already pending)\n",
-						       tindex, qdata->local_info.qp_num);
-				} else {
-					rdma_post_echo_send(qdata, tindex);
-				}
-			}
-		} else if (wc[i].status == IBV_WC_SUCCESS && wc[i].wr_id == RDMA_UD_SEND) {
-			qdata->stats.send_cqe_ok++;
-		} else if (wc[i].status == IBV_WC_SUCCESS && wc[i].opcode == IBV_WC_SEND) {
+		if (wc[i].wr_id == RDMA_UD_RECV)
+			continue;
+		if (wc[i].status == IBV_WC_SUCCESS &&
+		    (wc[i].wr_id == RDMA_UD_SEND || wc[i].opcode == IBV_WC_SEND)) {
 			qdata->stats.send_cqe_ok++;
 		} else {
 			qdata->stats.cqe_err++;
 		}
-
 		qdata->pending &= ~(int)wc[i].wr_id;
 		if ((!g_ctx.pingpong || g_ctx.qp_type != IBV_QPT_RC ||
 		     g_ctx.op_type != IBV_WR_SEND) &&
 		    qdata->dir != RDMA_UD_RECV && !(qdata->pending & RDMA_UD_SEND) &&
 		    (!g_ctx.num_pkt_set || qdata->num_pkt)) {
-			if (g_ctx.debug)
-				printf("[DEBUG][T:%d] Posting SEND on QP %u (loop tail)\n", tindex,
-				       qdata->local_info.qp_num);
+			if (post_send(qdata, RDMA_UD_SEND, IBV_WR_SEND))
+				return -1;
+			qdata->pending |= RDMA_UD_SEND;
+		}
+	}
+
+	/* Pass 2: RECV completions — pending is now clear for echo posting */
+	for (i = 0; i < ne; i++) {
+		if (wc[i].wr_id != RDMA_UD_RECV)
+			continue;
+
+		qdata->pending &= ~(int)RDMA_UD_RECV;
+
+		if (wc[i].status != IBV_WC_SUCCESS) {
+			qdata->stats.cqe_err++;
+			continue;
+		}
+		qdata->stats.recv_cqe_ok++;
+		qdata->rcnt--;
+
+		if (g_ctx.servername && g_ctx.pingpong && g_ctx.qp_type == IBV_QPT_RC &&
+		    g_ctx.op_type == IBV_WR_SEND && qdata->pending_echo_count > 0)
+			qdata->pending_echo_count--;
+
+		if (qdata->rcnt < g_ctx.rx_thold) {
+			int n = g_ctx.rx_depth - qdata->rcnt - 1;
+
+			j = post_recv(qdata, n, RDMA_UD_RECV);
+			if (j == 0)
+				return 0;
+		}
+
+		if (g_ctx.pingpong && g_ctx.qp_type == IBV_QPT_RC && g_ctx.op_type == IBV_WR_SEND &&
+		    (qdata->dir != RDMA_UD_RECV) && (!g_ctx.num_pkt_set || qdata->num_pkt)) {
+			if (!(qdata->pending & RDMA_UD_SEND))
+				rdma_post_echo_send(qdata, tindex);
+		}
+
+		if ((!g_ctx.pingpong || g_ctx.qp_type != IBV_QPT_RC ||
+		     g_ctx.op_type != IBV_WR_SEND) &&
+		    qdata->dir != RDMA_UD_RECV && !(qdata->pending & RDMA_UD_SEND) &&
+		    (!g_ctx.num_pkt_set || qdata->num_pkt)) {
 			if (post_send(qdata, RDMA_UD_SEND, IBV_WR_SEND))
 				return -1;
 			qdata->pending |= RDMA_UD_SEND;
@@ -1218,7 +1282,8 @@ rdma_handle_rdma_op(struct qp_data *qdata, int tindex, enum ibv_wr_opcode opcode
 
 	static __thread uint64_t dbg_ticks;
 
-	if (qdata->armed == 0 || qdata->cq == NULL || qdata->qp == NULL) {
+	if (qdata->armed == 0 || qdata->cq == NULL || qdata->qp == NULL ||
+	    (g_ctx.separate_cq && qdata->send_cq == NULL)) {
 		if (g_ctx.debug)
 			printf("[DEBUG][T:%d] Skipping RC op: null cq/qp on QP %u\n", tindex,
 			       qdata->local_info.qp_num);
@@ -1230,11 +1295,11 @@ rdma_handle_rdma_op(struct qp_data *qdata, int tindex, enum ibv_wr_opcode opcode
 			printf("[DEBUG][T:%d] Posting %s on QP %u\n", tindex,
 			       (opcode == IBV_WR_RDMA_READ ? "READ" : "WRITE"),
 			       qdata->local_info.qp_num);
-		post_send(qdata, wr_id, opcode);
-		qdata->pending = wr_id;
+		if (post_send(qdata, wr_id, opcode) == 0)
+			qdata->pending = wr_id;
 	}
 
-	ne = ibv_poll_cq(qdata->cq, 1, wc);
+	ne = ibv_poll_cq(qdata->send_cq ? qdata->send_cq : qdata->cq, 1, wc);
 	if (ne < 0) {
 		printf("poll CQ failed %d\n", ne);
 		return -1;
@@ -1262,11 +1327,12 @@ static inline int
 rdma_check_all_qp_num_pkt_count(struct qp_range *tq_range)
 {
 	uint32_t i;
-	struct qp_data *qdata;
+
+	if (!g_ctx.init_done)
+		return 0;
 
 	for (i = tq_range->start_qp; i <= tq_range->end_qp; i++) {
-		qdata = g_ctx.qp_data[i];
-		if (qdata && qdata->num_pkt)
+		if (g_ctx.qp_data[i] != NULL)
 			return 0;
 	}
 
@@ -1347,7 +1413,10 @@ rdma_mq_thread(void *arg)
 			       qdata->local_info.qp_num);
 		}
 
-		if ((g_ctx.num_pkt_set && qdata->num_pkt == 0 && qdata->pending_echo_count <= 0) ||
+		if ((g_ctx.num_pkt_set && qdata->num_pkt == 0 && qdata->pending_echo_count <= 0 &&
+		     qdata->pending == 0 &&
+		     (qdata->dir == RDMA_UD_SEND || g_ctx.op_type != IBV_WR_SEND ||
+		      qdata->stats.recv_cqe_ok >= g_ctx.num_pkts)) ||
 		    qdata->delete_me) {
 			qdata->armed = 0;
 			atomic_bitmap_clear(qid);
@@ -1443,6 +1512,7 @@ static struct option long_options[] = {{.name = "gid-idx", .has_arg = 1, .val = 
 				       {.name = "pingpong", .has_arg = 0, .val = 8},
 				       {.name = "no-pingpong", .has_arg = 0, .val = 9},
 				       {.name = "stats", .has_arg = 0, .val = 10},
+				       {.name = "separate-cq", .has_arg = 0, .val = 11},
 				       {0}};
 
 static inline void
@@ -1562,6 +1632,9 @@ parse_command_line(int argc, char *argv[])
 			break;
 		case 10:
 			g_ctx.stats_enabled = true;
+			break;
+		case 11:
+			g_ctx.separate_cq = true;
 			break;
 		default:
 			usage(argv[0]);
@@ -1694,7 +1767,7 @@ handle_server_accept(int epoll_fd, int *cclient, int *csock_fds, int *csock_coun
 			*csock_count = 0;
 		return 0;
 	}
-
+	g_ctx.init_done = true;
 	printf("Server Connected to remote\n");
 	return 0;
 }
@@ -1842,7 +1915,20 @@ rdma_dump_stats(void)
 	fprintf(fp, "========================================\n");
 
 	fclose(fp);
-	printf("Stats dumped to %s\n", filename);
+
+	printf("\n========================================\n");
+	printf("  Aggregate Statistics (%s / %s)\n", qp_type_str(g_ctx.qp_type),
+	       op_type_str(g_ctx.op_type));
+	printf("========================================\n");
+	printf("  Send WR posted   : %" PRIu64 "\n", total_send_wr);
+	printf("  Send WR failed   : %" PRIu64 "\n", total_send_fail);
+	printf("  Recv WR posted   : %" PRIu64 "\n", total_recv_wr);
+	printf("  Recv WR failed   : %" PRIu64 "\n", total_recv_fail);
+	printf("  Send CQE (ok)    : %" PRIu64 "\n", total_send_cqe);
+	printf("  Recv CQE (ok)    : %" PRIu64 "\n", total_recv_cqe);
+	printf("  CQE errors       : %" PRIu64 "\n", total_cqe_err);
+	printf("========================================\n");
+	printf("Per-QP details: %s\n", filename);
 }
 
 int
@@ -2057,6 +2143,7 @@ main(int argc, char **argv)
 			printf("Client connection init failed\n");
 			return -1;
 		}
+		g_ctx.init_done = true;
 		printf("Client Connected to remote\n");
 	}
 

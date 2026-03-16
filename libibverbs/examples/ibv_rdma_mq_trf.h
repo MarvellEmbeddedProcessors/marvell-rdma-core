@@ -68,7 +68,8 @@ struct qp_stats_record {
 
 struct qp_data {
 	struct ibv_qp *qp;
-	struct ibv_cq *cq;
+	struct ibv_cq *cq;      /* recv CQ (or shared CQ when !separate_cq) */
+	struct ibv_cq *send_cq; /* send CQ (NULL when using shared CQ) */
 	struct ibv_mr *mr;
 	struct ibv_ah *ah;
 	struct qp_info local_info;
@@ -126,6 +127,8 @@ struct app_ctx {
 	int total_slots;
 	bool pingpong;
 	bool stats_enabled;
+	bool separate_cq;
+	volatile bool init_done;
 };
 
 #define MAX_CLIENTS 2048
