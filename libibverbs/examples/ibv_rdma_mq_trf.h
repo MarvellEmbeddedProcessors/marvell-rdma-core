@@ -87,6 +87,7 @@ struct qp_data {
 	int armed;
 	uint64_t send_posted_count;
 	int pending_echo_count;
+	int deferred_echo;
 	struct qp_stats stats;
 };
 

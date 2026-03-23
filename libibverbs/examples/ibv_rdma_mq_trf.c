@@ -733,10 +733,17 @@ post_recv(struct qp_data *qdata, int rxdepth, int wr_id)
 	struct ibv_recv_wr *bad_recv;
 	int j;
 
-	for (int sge_idx = 0; sge_idx < g_ctx.nb_sge; ++sge_idx) {
-		recv_sge_arr[sge_idx].addr = (uintptr_t)qdata->buf_arr[sge_idx];
-		recv_sge_arr[sge_idx].length = g_ctx.msg_size + 40;
-		recv_sge_arr[sge_idx].lkey = qdata->mr_arr[sge_idx]->lkey;
+	{
+		uint32_t grh_len = (g_ctx.qp_type == IBV_QPT_UD) ? 40 : 0;
+		uint32_t total = g_ctx.msg_size + grh_len;
+		uint32_t per_sge = total / g_ctx.nb_sge;
+		uint32_t remainder = total % g_ctx.nb_sge;
+
+		for (int sge_idx = 0; sge_idx < g_ctx.nb_sge; ++sge_idx) {
+			recv_sge_arr[sge_idx].addr = (uintptr_t)qdata->buf_arr[sge_idx];
+			recv_sge_arr[sge_idx].length = per_sge + (sge_idx < (int)remainder ? 1 : 0);
+			recv_sge_arr[sge_idx].lkey = qdata->mr_arr[sge_idx]->lkey;
+		}
 	}
 	recv_wr.wr_id = wr_id;
 	recv_wr.sg_list = &recv_sge_arr[0];
@@ -827,11 +834,22 @@ rdma_mq_init(int csock, struct device_ctx *dev)
 		}
 	}
 
-	// Ensure we have enough free slots to host this client's QPs
-	if (count_free_slots() < g_ctx.numqp) {
-		printf("Not enough free QP slots available (need %d, have %d)\n", g_ctx.numqp,
-		       count_free_slots());
-		return -1;
+	/*
+	 * Ensure we have enough free slots to host this client's QPs.
+	 * Worker threads from a previous client may still be cleaning up
+	 * (rdma_cleanup runs asynchronously in the worker); give them a
+	 * brief window (up to ~2 s) before rejecting the new connection.
+	 */
+	{
+		int wait_retries = 0;
+
+		while (count_free_slots() < g_ctx.numqp && wait_retries++ < 200)
+			usleep(10000);
+		if (count_free_slots() < g_ctx.numqp) {
+			printf("Not enough free QP slots available (need %d, have %d)\n",
+			       g_ctx.numqp, count_free_slots());
+			return -1;
+		}
 	}
 
 	for (i = 0; i < g_ctx.numqp; i++) {
@@ -1047,6 +1065,7 @@ rdma_mq_init(int csock, struct device_ctx *dev)
 		data->armed = 1;
 		data->send_posted_count = 0;
 		data->pending_echo_count = 0;
+		data->deferred_echo = 0;
 
 		g_ctx.qp_data[slot] = data;
 		continue;
@@ -1076,10 +1095,15 @@ post_send(struct qp_data *qdata, int wr_id, int opcode)
 	struct ibv_send_wr send_wr = {0};
 	struct ibv_send_wr *bad_send;
 
-	for (int sge_idx = 0; sge_idx < g_ctx.nb_sge; ++sge_idx) {
-		send_sge_arr[sge_idx].addr = (uintptr_t)qdata->buf_arr[sge_idx] + 40;
-		send_sge_arr[sge_idx].length = g_ctx.msg_size;
-		send_sge_arr[sge_idx].lkey = qdata->mr_arr[sge_idx]->lkey;
+	{
+		uint32_t per_sge = g_ctx.msg_size / g_ctx.nb_sge;
+		uint32_t remainder = g_ctx.msg_size % g_ctx.nb_sge;
+
+		for (int sge_idx = 0; sge_idx < g_ctx.nb_sge; ++sge_idx) {
+			send_sge_arr[sge_idx].addr = (uintptr_t)qdata->buf_arr[sge_idx] + 40;
+			send_sge_arr[sge_idx].length = per_sge + (sge_idx < (int)remainder ? 1 : 0);
+			send_sge_arr[sge_idx].lkey = qdata->mr_arr[sge_idx]->lkey;
+		}
 	}
 	send_wr.wr_id = wr_id;
 	send_wr.sg_list = &send_sge_arr[0];
@@ -1145,7 +1169,7 @@ static inline int
 rdma_handle_rdma_send(struct qp_data *qdata, int tindex)
 {
 	struct ibv_wc wc[16];
-	int ne, i, j;
+	int ne, i;
 
 	static __thread uint64_t dbg_ticks;
 
@@ -1189,6 +1213,16 @@ rdma_handle_rdma_send(struct qp_data *qdata, int tindex)
 			else
 				qdata->stats.cqe_err++;
 			qdata->pending &= ~(int)wc[i].wr_id;
+			/* SEND CQE cleared the pending flag; if an echo
+			 * was deferred (RECV arrived while SEND was still
+			 * in flight), post it now.
+			 */
+			if (g_ctx.pingpong && g_ctx.qp_type == IBV_QPT_RC &&
+			    g_ctx.op_type == IBV_WR_SEND && !(qdata->pending & RDMA_UD_SEND) &&
+			    qdata->deferred_echo > 0 && (!g_ctx.num_pkt_set || qdata->num_pkt)) {
+				qdata->deferred_echo--;
+				rdma_post_echo_send(qdata, tindex);
+			}
 		}
 	}
 
@@ -1227,6 +1261,17 @@ rdma_handle_rdma_send(struct qp_data *qdata, int tindex)
 				return -1;
 			qdata->pending |= RDMA_UD_SEND;
 		}
+		/* RC SEND pingpong: a RECV CQE may have arrived while a
+		 * previous echo SEND was still pending in the shared CQ.
+		 * Now that the SEND CQE has cleared pending, post the
+		 * deferred echo.
+		 */
+		if (g_ctx.pingpong && g_ctx.qp_type == IBV_QPT_RC && g_ctx.op_type == IBV_WR_SEND &&
+		    !(qdata->pending & RDMA_UD_SEND) && qdata->deferred_echo > 0 &&
+		    (!g_ctx.num_pkt_set || qdata->num_pkt)) {
+			qdata->deferred_echo--;
+			rdma_post_echo_send(qdata, tindex);
+		}
 	}
 
 	/* Pass 2: RECV completions — pending is now clear for echo posting */
@@ -1250,15 +1295,24 @@ rdma_handle_rdma_send(struct qp_data *qdata, int tindex)
 		if (qdata->rcnt < g_ctx.rx_thold) {
 			int n = g_ctx.rx_depth - qdata->rcnt - 1;
 
-			j = post_recv(qdata, n, RDMA_UD_RECV);
-			if (j == 0)
-				return 0;
+			/*
+			 * Do not return early on post_recv failure; the
+			 * RECV CQE has already been consumed from the CQ
+			 * and the received data must still be processed.
+			 */
+			post_recv(qdata, n, RDMA_UD_RECV);
 		}
 
 		if (g_ctx.pingpong && g_ctx.qp_type == IBV_QPT_RC && g_ctx.op_type == IBV_WR_SEND &&
 		    (qdata->dir != RDMA_UD_RECV) && (!g_ctx.num_pkt_set || qdata->num_pkt)) {
 			if (!(qdata->pending & RDMA_UD_SEND))
 				rdma_post_echo_send(qdata, tindex);
+			else
+				/* A SEND is already in flight on this QP;
+				 * defer the echo until its CQE clears the
+				 * pending flag (handled in Pass 1).
+				 */
+				qdata->deferred_echo++;
 		}
 
 		if ((!g_ctx.pingpong || g_ctx.qp_type != IBV_QPT_RC ||
@@ -1416,14 +1470,22 @@ rdma_mq_thread(void *arg)
 		if ((g_ctx.num_pkt_set && qdata->num_pkt == 0 && qdata->pending_echo_count <= 0 &&
 		     qdata->pending == 0 &&
 		     (qdata->dir == RDMA_UD_SEND || g_ctx.op_type != IBV_WR_SEND ||
-		      qdata->stats.recv_cqe_ok >= g_ctx.num_pkts)) ||
+		      g_ctx.qp_type == IBV_QPT_UD || qdata->stats.recv_cqe_ok >= g_ctx.num_pkts)) ||
 		    qdata->delete_me) {
 			qdata->armed = 0;
 			atomic_bitmap_clear(qid);
 			save_qp_stats(qid, qdata);
+			/*
+			 * Destroy QP/CQ/MR before clearing the slot.
+			 * cleanup_client_fd_resources polls
+			 * g_ctx.qp_data[qid] == NULL to decide when
+			 * it is safe to call ibv_dealloc_pd; if the
+			 * slot is NULLed first, the PD dealloc races
+			 * with still-live resources and fails.
+			 */
+			rdma_cleanup(qdata);
 			g_ctx.qp_data[qid] = NULL;
-			if (!rdma_cleanup(qdata))
-				free(qdata);
+			free(qdata);
 		}
 
 		if (!g_ctx.is_server && g_ctx.num_pkt_set &&
