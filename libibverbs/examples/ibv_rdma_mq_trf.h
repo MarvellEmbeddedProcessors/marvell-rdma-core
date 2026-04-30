@@ -8,6 +8,7 @@
 #include <stdatomic.h>
 
 #include <infiniband/verbs.h>
+#include <rdma/rdma_cma.h>
 
 #define MIN_CPU_CORE 2
 #define MAX_CPU_CORE 10
@@ -84,11 +85,76 @@ struct qp_data {
 	void **buf_arr;
 	struct ibv_mr **mr_arr;
 	int delete_me;
-	int armed;
-	uint64_t send_posted_count;
+	int armed;         // 1 when QP/CQ are fully ready and safe to poll
+	int cleaned_up;    // 1 when cleanup has been called to prevent double cleanup
+	int is_rdma_cm;    // 1 if this QP was created by RDMA CM, 0 for manually created QPs
+	int is_ah_rdma_cm; // 1 if this AH was created by RDMA CM, 0 for manually created AHs
+	int is_cq_rdma_cm; // 1 if this CQ was created by RDMA CM, 0 for manually created CQs
+	uint64_t send_posted_count; // number of sends posted (for signaled interval)
 	int pending_echo_count;
 	int deferred_echo;
 	struct qp_stats stats;
+	uint32_t remote_qkey;
+};
+
+/* Connection parameters sent from client to server */
+struct conn_params {
+	int qp_type;
+	int op_type;
+	int num_pkts;
+	int msg_size;
+	int numqp; // Number of QPs requested by client
+};
+
+/* RDMA CM node structure similar to udaddy.c */
+struct cm_node {
+	int id;
+	struct rdma_cm_id *cma_id;
+	int connected;
+	int initialized; // Flag to prevent multiple initialization
+	struct ibv_pd *pd;
+	struct ibv_cq *cq;
+	struct ibv_mr *mr;
+	struct ibv_ah *ah;
+	uint32_t remote_qpn;
+	uint32_t remote_qkey;
+	void *mem;
+	struct qp_data *qp_data_list; // List of QP data for this connection
+	int qp_count;
+	struct conn_params conn_params; // Connection parameters for threading integration
+
+	/* MR info exchanged via CM private_data */
+	uint32_t exchange_rkey;
+	uint64_t exchange_addr;
+	uint32_t remote_rkey_cm;
+	uint64_t remote_addr_cm;
+	int mr_info_valid;
+	struct ibv_mr *data_mr;
+	void *data_buf;
+};
+
+/* Connection context for both TCP and RDMA CM */
+struct conn_ctx {
+	enum { CONN_TYPE_TCP, CONN_TYPE_RDMA_CM } type;
+	union {
+		struct {
+			int csock;
+		} tcp;
+		struct {
+			struct cm_node *node;
+		} cm;
+	} u;
+	struct device_ctx *dev;
+	int client_idx;
+};
+
+/* RDMA CM test context */
+struct cm_test {
+	struct rdma_event_channel *channel;
+	struct cm_node *nodes;
+	int conn_index;
+	int connects_left;
+	struct rdma_addrinfo *rai;
 };
 
 struct app_ctx {
@@ -107,6 +173,9 @@ struct app_ctx {
 	char *ib_devname;
 	unsigned int interval;
 	unsigned int num_pkts;
+	bool use_rdma_cm; // Enable RDMA CM mode instead of TCP
+	char *src_addr;   // Source address for RDMA CM
+	char *port;       // Port for RDMA CM
 	bool num_pkt_set;
 	unsigned int msg_size;
 	int num_threads;
