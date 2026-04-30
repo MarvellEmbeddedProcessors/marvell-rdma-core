@@ -4,7 +4,6 @@
 
 #define _GNU_SOURCE
 #include <sched.h>
-#include <config.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -15,6 +14,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <inttypes.h>
+#include <endian.h>
 #include <arpa/inet.h>
 #include <pthread.h>
 #include <sched.h>
@@ -31,6 +31,10 @@
 #include <ifaddrs.h>
 #include <errno.h>
 #include <limits.h>
+#include <rdma/rdma_cma.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
 #include <time.h>
 
 #include <stdio.h>
@@ -44,6 +48,8 @@
 static struct device_ctx g_devices[MAX_IB_DEVICES];
 static int g_num_devices;
 struct app_ctx g_ctx = {0};
+static struct cm_test cm_test = {0};
+static struct rdma_addrinfo hints = {0};
 static struct qp_stats_record g_saved_stats[MAX_QUEUES];
 static void save_qp_stats(int slot, struct qp_data *qdata);
 
@@ -51,6 +57,23 @@ static void save_qp_stats(int slot, struct qp_data *qdata);
 void atomic_bitmap_set(uint16_t count_id);
 void atomic_bitmap_clear(uint16_t count_id);
 int atomic_bitmap_is_set(uint16_t count_id);
+
+/* TCP functions forward declarations */
+static int recv_remote_info(int rsock, struct qp_info *local, struct qp_info *remote);
+static int send_local_info(int rsock, struct qp_info *local);
+
+/* CM functions forward declarations */
+static void cm_connect_error(void);
+static int cm_alloc_nodes(void);
+static void cm_destroy_nodes(void);
+
+/* Init functions forward declarations */
+int rdma_mq_init(int csock, struct device_ctx *dev);
+int rdma_mq_init_unified(struct conn_ctx *conn);
+void *rdma_mq_thread(void *arg);
+
+/* QP division among threads */
+struct qp_range *divide_qps_among_threads(int total_qps, int nthreads);
 
 static void
 add_ip_to_device(struct device_ctx *dev, const char *ip)
@@ -176,7 +199,6 @@ enumerate_ib_devices_and_ips(void)
 	return ret;
 }
 
-struct qp_range *divide_qps_among_threads(int total_qps, int nthreads);
 static int
 count_free_slots(void)
 {
@@ -192,24 +214,14 @@ count_free_slots(void)
 static int
 find_free_slot(void)
 {
-	for (int i = 0; i < g_ctx.total_slots; ++i) {
+	int limit = g_ctx.total_slots > 0 ? g_ctx.total_slots : MAX_QUEUES;
+
+	for (int i = 0; i < limit; ++i) {
 		if (!atomic_bitmap_is_set(i) && g_ctx.qp_data[i] == NULL)
 			return i;
 	}
 	return -1;
 }
-
-// Connection parameters sent from client to server
-struct conn_params {
-	int qp_type;
-	int op_type;
-	int num_pkts;
-	int msg_size;
-	int numqp; // Number of QPs requested by client
-};
-
-int rdma_mq_init(int csock, struct device_ctx *dev);
-void *rdma_mq_thread(void *arg);
 
 static void
 signal_handler(int signum)
@@ -245,6 +257,9 @@ usage(const char *argv0)
 	printf("  -m, --mtu=<size>       path MTU (default 1024)\n");
 	printf("  -z, --size=<size>      message size in bytes (default 1024)\n");
 	printf("  --nb-sge=<num>         number of SGEs per WR (default 1)\n");
+	printf("  --rdma-cm           Use RDMA CM instead of TCP for connections\n");
+	printf("  --src-addr=<addr>   Source address for RDMA CM\n");
+	printf("  --cm-port=<port>    Port for RDMA CM (default 7174)\n");
 	printf("  --qp-type=<UD|RC> QP type (default: UD)\n");
 	printf("  --op-type=<SEND|WRITE|WRITE_IMM|READ> Operation type (default: SEND)\n");
 	printf("  --max-send-wr=<N>   SQ depth per QP (default 2)\n");
@@ -283,9 +298,19 @@ rdma_init_default(void)
 	g_ctx.nb_sge = 1;      // Default SGE count
 	memset(&g_ctx.qbmap, 0, sizeof(g_ctx.qbmap));
 	g_ctx.max_send_wr = 2;
+	g_ctx.debug = false;    // Debug disabled by default, use -D to enable
 	g_ctx.signal_every = 1; // signal every send by default
 	g_ctx.inline_thresh = 0;
 	g_ctx.pingpong = true;
+	g_ctx.use_rdma_cm = false; // default to TCP mode
+	g_ctx.src_addr = NULL;
+	g_ctx.port = strdup("7174"); // default port for RDMA CM
+
+	/* Initialize RDMA CM hints - will be updated based on QP type */
+	memset(&hints, 0, sizeof(hints));
+	hints.ai_port_space = RDMA_PS_UDP; // Default for UD, updated based on QP type
+	hints.ai_flags = RAI_PASSIVE;      // For server binding (updated later for client)
+	hints.ai_family = AF_INET;         // Use IPv4 addresses
 	g_ctx.stats_enabled = false;
 	g_ctx.separate_cq = false;
 }
@@ -481,7 +506,7 @@ tcp_connect_to_server(const char *ip, int port)
 	return csockfd;
 }
 
-// Exchange QP info as before
+/* Exchange QP info as before */
 static int
 tcp_exchange_info(int rsock, struct qp_info *local, struct qp_info *remote)
 {
@@ -492,7 +517,7 @@ tcp_exchange_info(int rsock, struct qp_info *local, struct qp_info *remote)
 	return 0;
 }
 
-// Send connection params (client) and receive (server)
+/* Send connection params (client) and receive (server)*/
 static int
 send_conn_params(int sock, struct conn_params *params)
 {
@@ -503,6 +528,86 @@ static int
 recv_conn_params(int sock, struct conn_params *params)
 {
 	return read(sock, params, sizeof(*params)) == sizeof(*params) ? 0 : -1;
+}
+
+/* Unified parameter exchange for both TCP and RDMA CM */
+static int
+unified_send_conn_params(struct conn_ctx *conn, struct conn_params *params)
+{
+	switch (conn->type) {
+	case CONN_TYPE_TCP:
+		return send_conn_params(conn->u.tcp.csock, params);
+	case CONN_TYPE_RDMA_CM:
+		// For RDMA CM, we can use private data or a separate mechanism
+		// For now, store parameters in the node for later use
+		if (conn->u.cm.node) {
+			memcpy(&conn->u.cm.node->conn_params, params, sizeof(*params));
+			return 0;
+		}
+		return -1;
+	default:
+		return -1;
+	}
+}
+
+static int
+unified_recv_conn_params(struct conn_ctx *conn, struct conn_params *params)
+{
+	switch (conn->type) {
+	case CONN_TYPE_TCP:
+		return recv_conn_params(conn->u.tcp.csock, params);
+	case CONN_TYPE_RDMA_CM:
+		// For RDMA CM, retrieve from node or private data
+		if (conn->u.cm.node) {
+			memcpy(params, &conn->u.cm.node->conn_params, sizeof(*params));
+			return 0;
+		}
+		return -1;
+	default:
+		return -1;
+	}
+}
+
+/* Unified QP info exchange */
+static int
+unified_exchange_qp_info(struct conn_ctx *conn, struct qp_info *local, struct qp_info *remote)
+{
+	switch (conn->type) {
+	case CONN_TYPE_TCP:
+		if (g_ctx.is_server)
+			return recv_remote_info(conn->u.tcp.csock, local, remote);
+		else
+			return tcp_exchange_info(conn->u.tcp.csock, local, remote);
+	case CONN_TYPE_RDMA_CM:
+		// For RDMA CM, QP info is available through the connection event
+		if (conn->u.cm.node && conn->u.cm.node->connected) {
+			// Extract QP info from RDMA CM node
+			remote->qp_num = conn->u.cm.node->remote_qpn;
+			remote->lid = 0;  // Not used for RDMA CM UD
+			remote->psn = 0;  // Not used for UD
+			remote->rkey = 0; // Will be set if needed for RC
+			// For UD, GID info is in the AH, for RC it's in the route
+			memset(&remote->gid, 0, sizeof(remote->gid));
+			return 0;
+		}
+		return -1;
+	default:
+		return -1;
+	}
+}
+
+static int
+unified_send_qp_info(struct conn_ctx *conn, struct qp_info *local)
+{
+	switch (conn->type) {
+	case CONN_TYPE_TCP:
+		return send_local_info(conn->u.tcp.csock, local);
+	case CONN_TYPE_RDMA_CM:
+		// For RDMA CM, QP info is sent through connection parameters
+		return 0; // Already handled during connection establishment
+	default:
+		return -1;
+	}
 }
 
 static int
@@ -517,6 +622,807 @@ recv_remote_info(int rsock, struct qp_info *local, struct qp_info *remote)
 	}
 
 	return -1;
+}
+
+/* Structure for MR info exchange via CM private_data */
+struct cm_private_exchange {
+	uint64_t addr;
+	uint32_t rkey;
+	uint32_t magic;
+	uint32_t op_type;
+	uint32_t num_pkts;
+	uint32_t msg_size;
+};
+
+#define CM_EXCH_MAGIC 0x52444D41
+
+static int
+get_rdma_addr(const char *src, const char *dst, const char *port, struct rdma_addrinfo *hints_param,
+	      struct rdma_addrinfo **rai)
+{
+	int ret;
+
+	ret = rdma_getaddrinfo(dst, port, hints_param, rai);
+	if (ret) {
+		printf("rdma_getaddrinfo: %s\n", gai_strerror(ret));
+		return ret;
+	}
+
+	return 0;
+}
+
+static struct rdma_event_channel *
+create_event_channel(void)
+{
+	struct rdma_event_channel *channel;
+
+	channel = rdma_create_event_channel();
+	if (!channel) {
+		printf("Failed to create event channel\n");
+		return NULL;
+	}
+
+	return channel;
+}
+
+static int
+cm_create_message(struct cm_node *node)
+{
+	if (!g_ctx.msg_size)
+		return 0;
+
+	node->mem = malloc(g_ctx.msg_size + sizeof(struct ibv_grh));
+	if (!node->mem) {
+		printf("failed message allocation\n");
+		return -1;
+	}
+
+	node->mr = ibv_reg_mr(node->pd, node->mem, g_ctx.msg_size + sizeof(struct ibv_grh),
+			      IBV_ACCESS_LOCAL_WRITE);
+	if (!node->mr) {
+		printf("failed to reg MR\n");
+		goto err;
+	}
+	return 0;
+err:
+	free(node->mem);
+	return -1;
+}
+
+static int
+cm_verify_test_params(struct cm_node *node)
+{
+	struct ibv_port_attr port_attr;
+	int ret;
+
+	ret = ibv_query_port(node->cma_id->verbs, node->cma_id->port_num, &port_attr);
+	if (ret)
+		return ret;
+
+	if (g_ctx.msg_size && g_ctx.msg_size > (1 << (port_attr.active_mtu + 7))) {
+		printf("rdma_cm: message_size %d is larger than active mtu %d\n", g_ctx.msg_size,
+		       1 << (port_attr.active_mtu + 7));
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int
+cm_init_node(struct cm_node *node)
+{
+	struct ibv_qp_init_attr init_qp_attr;
+	int cqe, ret;
+
+	node->pd = ibv_alloc_pd(node->cma_id->verbs);
+	if (!node->pd) {
+		ret = -ENOMEM;
+		printf("rdma_cm: unable to allocate PD\n");
+		goto out;
+	}
+
+	/* CQ must hold: rx_depth recv + max_send_wr send + 4 spare */
+	cqe = g_ctx.rx_depth + g_ctx.max_send_wr + 4;
+	if (g_ctx.num_pkts > 0 && g_ctx.num_pkts * 2 > cqe)
+		cqe = g_ctx.num_pkts * 2;
+	node->cq = ibv_create_cq(node->cma_id->verbs, cqe, node, NULL, 0);
+	if (!node->cq) {
+		ret = -ENOMEM;
+		printf("rdma_cm: unable to create CQ (cqe=%d)\n", cqe);
+		goto out;
+	}
+
+	memset(&init_qp_attr, 0, sizeof(init_qp_attr));
+	init_qp_attr.cap.max_send_wr = g_ctx.max_send_wr;
+	init_qp_attr.cap.max_recv_wr = g_ctx.rx_depth;
+	init_qp_attr.cap.max_send_sge = 1;
+	init_qp_attr.cap.max_recv_sge = 1;
+	init_qp_attr.qp_context = node;
+	init_qp_attr.sq_sig_all = 0;
+	init_qp_attr.qp_type = g_ctx.qp_type;
+	init_qp_attr.send_cq = node->cq;
+	init_qp_attr.recv_cq = node->cq;
+	ret = rdma_create_qp(node->cma_id, node->pd, &init_qp_attr);
+	if (ret) {
+		perror("rdma_cm: unable to create QP");
+		goto out;
+	}
+
+	/* INIT->INIT re-modify: rdma_create_qp sets access_flags=0.
+	 * We must add REMOTE_WRITE + REMOTE_READ for RDMA ops to work. */
+	{
+		struct ibv_qp_attr qpa_init;
+
+		memset(&qpa_init, 0, sizeof(qpa_init));
+		qpa_init.qp_state = IBV_QPS_INIT;
+		qpa_init.qp_access_flags =
+			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+		qpa_init.pkey_index = 0;
+		qpa_init.port_num = node->cma_id->port_num;
+		ret = ibv_modify_qp(node->cma_id->qp, &qpa_init,
+				    IBV_QP_STATE | IBV_QP_ACCESS_FLAGS | IBV_QP_PKEY_INDEX |
+					    IBV_QP_PORT);
+	}
+	ret = cm_create_message(node);
+	if (ret) {
+		printf("rdma_cm: failed to create messages: %d\n", ret);
+		goto out;
+	}
+
+	/* Register data buffer MR with remote write for RDMA WRITE */
+	if (g_ctx.qp_type == IBV_QPT_RC) {
+		size_t buf_sz = g_ctx.msg_size + 40;
+
+		node->data_buf = calloc(1, buf_sz);
+		if (!node->data_buf) {
+			ret = -ENOMEM;
+			goto out;
+		}
+		node->data_mr = ibv_reg_mr(node->pd, node->data_buf, buf_sz,
+					   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
+						   IBV_ACCESS_REMOTE_READ);
+		if (!node->data_mr) {
+			free(node->data_buf);
+			node->data_buf = NULL;
+			ret = -ENOMEM;
+			goto out;
+		}
+		node->exchange_rkey = node->data_mr->rkey;
+		node->exchange_addr = (uintptr_t)node->data_buf + 40;
+	}
+out:
+	return ret;
+}
+
+static void
+cm_connect_error(void)
+{
+	cm_test.connects_left--;
+}
+
+static int
+cm_addr_handler(struct cm_node *node)
+{
+	int ret;
+
+	ret = rdma_resolve_route(node->cma_id, 2000);
+	if (ret) {
+		perror("rdma_cm: resolve route failed");
+		cm_connect_error();
+	}
+	return ret;
+}
+
+static int
+cm_route_handler(struct cm_node *node)
+{
+	struct rdma_conn_param conn_param;
+	int ret;
+
+	ret = cm_verify_test_params(node);
+	if (ret)
+		goto err;
+
+	ret = cm_init_node(node);
+	if (ret)
+		goto err;
+
+	memset(&conn_param, 0, sizeof(conn_param));
+	conn_param.rnr_retry_count = 7;
+	if (g_ctx.qp_type == IBV_QPT_RC && node->data_mr) {
+		static struct cm_private_exchange client_exch;
+
+		client_exch.addr = node->exchange_addr;
+		client_exch.rkey = node->exchange_rkey;
+		client_exch.magic = CM_EXCH_MAGIC;
+		client_exch.op_type = g_ctx.op_type;
+		client_exch.num_pkts = g_ctx.num_pkts;
+		client_exch.msg_size = g_ctx.msg_size;
+		conn_param.private_data = &client_exch;
+		conn_param.private_data_len = sizeof(client_exch);
+	} else if (g_ctx.qp_type == IBV_QPT_UD) {
+		/* UD/SIDR: pack client QPN + test params in SIDR_REQ private_data.
+		 * The server never gets ESTABLISHED for SIDR, so it reads these
+		 * at CONNECT_REQUEST to learn the client's QPN and test params. */
+		static struct cm_private_exchange ud_client_exch;
+
+		ud_client_exch.magic = CM_EXCH_MAGIC;
+		ud_client_exch.addr = (uint64_t)node->cma_id->qp->qp_num;
+		ud_client_exch.rkey = 0;
+		ud_client_exch.op_type = g_ctx.op_type;
+		ud_client_exch.num_pkts = g_ctx.num_pkts;
+		ud_client_exch.msg_size = g_ctx.msg_size;
+		conn_param.private_data = &ud_client_exch;
+		conn_param.private_data_len = sizeof(ud_client_exch);
+	} else {
+		conn_param.private_data = cm_test.rai->ai_connect;
+		conn_param.private_data_len = cm_test.rai->ai_connect_len;
+	}
+	ret = rdma_connect(node->cma_id, &conn_param);
+	if (ret) {
+		perror("rdma_cm: failure connecting");
+		goto err;
+	}
+	return 0;
+err:
+	cm_connect_error();
+	return ret;
+}
+
+static int cm_integrate_connection(struct cm_node *node);
+
+static int
+cm_connect_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
+{
+	struct cm_node *node;
+	struct rdma_conn_param conn_param;
+	int ret;
+
+	if (cm_test.conn_index == g_ctx.num_client) {
+		ret = -ENOMEM;
+		goto err1;
+	}
+	node = &cm_test.nodes[cm_test.conn_index++];
+
+	node->cma_id = cma_id;
+	cma_id->context = node;
+
+	// Check if this connection has already been processed
+	if (node->initialized) {
+		printf("RDMA CM connection already initialized, skipping\n");
+		return 0;
+	}
+
+	ret = cm_verify_test_params(node);
+	if (ret)
+		goto err2;
+
+	ret = cm_init_node(node);
+	if (ret)
+		goto err2;
+
+	/* Read client MR info from REQ private_data */
+	if (g_ctx.qp_type == IBV_QPT_RC &&
+	    event->param.conn.private_data_len >= sizeof(struct cm_private_exchange)) {
+		const struct cm_private_exchange *peer =
+			(const struct cm_private_exchange *)event->param.conn.private_data;
+		if (peer->magic == CM_EXCH_MAGIC) {
+			node->remote_rkey_cm = peer->rkey;
+			node->remote_addr_cm = peer->addr;
+			node->mr_info_valid = 1;
+			/* Apply client conn params so server matches */
+			/* Always apply - IBV_WR_RDMA_WRITE is 0, cannot use truthiness check */
+			g_ctx.op_type = peer->op_type;
+			if (peer->num_pkts) {
+				g_ctx.num_pkts = peer->num_pkts;
+				/* Only set num_pkt_set for SEND mode where server actively sends.
+				 * For WRITE/READ the server is passive - dont trigger exit
+				 * condition */
+				if (peer->op_type == IBV_WR_SEND)
+					g_ctx.num_pkt_set = 1;
+			}
+			if (peer->msg_size)
+				g_ctx.msg_size = peer->msg_size;
+		}
+	}
+
+	/* For UD: read client QPN and test params from SIDR_REQ private_data.
+	 * Also create AH for the client so the server can send replies.
+	 * The UD server never receives ESTABLISHED in SIDR, so this is the
+	 * only chance to learn the client's identity. */
+	if (g_ctx.qp_type == IBV_QPT_UD &&
+	    event->param.ud.private_data_len >= sizeof(struct cm_private_exchange)) {
+		const struct cm_private_exchange *ud_peer =
+			(const struct cm_private_exchange *)event->param.ud.private_data;
+		if (ud_peer->magic == CM_EXCH_MAGIC) {
+			node->remote_qpn = (uint32_t)ud_peer->addr;
+			/* Always apply - IBV_WR_RDMA_WRITE is 0 */
+			g_ctx.op_type = ud_peer->op_type;
+			if (ud_peer->num_pkts) {
+				g_ctx.num_pkts = ud_peer->num_pkts;
+				if (ud_peer->op_type == IBV_WR_SEND)
+					g_ctx.num_pkt_set = 1;
+			}
+			if (ud_peer->msg_size)
+				g_ctx.msg_size = ud_peer->msg_size;
+		}
+		/* Create AH from the requester's address info in the SIDR_REQ */
+		node->ah = ibv_create_ah(node->pd, &event->param.ud.ah_attr);
+		node->remote_qkey = event->param.ud.qkey;
+		if (!node->remote_qkey)
+			node->remote_qkey = 0x01234567; /* RDMA_UDP_QKEY default */
+	}
+
+	memset(&conn_param, 0, sizeof(conn_param));
+	conn_param.rnr_retry_count = 7;
+	if (g_ctx.qp_type == IBV_QPT_UD)
+		conn_param.qp_num = node->cma_id->qp->qp_num;
+
+	/* For RC: put server MR in REP private_data, detach QP from rdma_accept
+	 * to skip broken ucma_modify_qp_rtr/rts on octep_rdma driver. */
+	struct ibv_qp *saved_qp = NULL;
+
+	if (g_ctx.qp_type == IBV_QPT_RC && node->data_mr) {
+		static struct cm_private_exchange srv_exch;
+
+		srv_exch.addr = node->exchange_addr;
+		srv_exch.rkey = node->exchange_rkey;
+		srv_exch.magic = CM_EXCH_MAGIC;
+		conn_param.private_data = &srv_exch;
+		conn_param.private_data_len = sizeof(srv_exch);
+		saved_qp = node->cma_id->qp;
+		conn_param.qp_num = saved_qp->qp_num;
+		node->cma_id->qp = NULL;
+	}
+
+	ret = rdma_accept(node->cma_id, &conn_param);
+	if (saved_qp)
+		node->cma_id->qp = saved_qp;
+	if (ret) {
+		perror("rdma_cm: failure accepting");
+		goto err2;
+	}
+
+	printf("RDMA CM connection request accepted (QP %u)\n",
+	       node->cma_id->qp ? node->cma_id->qp->qp_num : 0);
+
+	if (g_ctx.qp_type == IBV_QPT_UD) {
+		node->connected = 1;
+		cm_test.connects_left--;
+		ret = cm_integrate_connection(node);
+		if (ret < 0)
+			goto err2;
+	}
+
+	return 0;
+
+err2:
+	node->cma_id = NULL;
+	cm_connect_error();
+err1:
+	printf("rdma_cm: failing connection request\n");
+	rdma_reject(cma_id, NULL, 0);
+	return ret;
+}
+
+static int
+cm_integrate_connection(struct cm_node *node)
+{
+	struct conn_ctx conn;
+	int ret;
+
+	// Check if already initialized to prevent double integration
+	if (node->initialized) {
+		if (g_ctx.debug)
+			printf("RDMA CM connection already integrated with threading system\n");
+		return 0;
+	}
+
+	// Find or create device context
+	struct device_ctx *dev = NULL;
+
+	if (g_num_devices > 0) {
+		// Use existing device context if available (server mode)
+		dev = &g_devices[0];
+	} else {
+		// For RDMA CM client, create a minimal device context from the CM connection
+		if (g_num_devices >= MAX_IB_DEVICES) {
+			printf("Too many devices, cannot add RDMA CM device\n");
+			goto err;
+		}
+		dev = &g_devices[g_num_devices];
+		dev->dev_ctx = node->cma_id->verbs;
+		dev->ib_devname = strdup(ibv_get_device_name(node->cma_id->verbs->device));
+		dev->ip_list = NULL;
+		dev->ip_count = 0;
+		// Initialize client PDs array
+		for (int k = 0; k < MAX_CLIENTS; ++k) {
+			dev->client_pds[k] = NULL;
+			dev->fd_to_client_idx[k] = -1;
+		}
+		g_num_devices++;
+		printf("RDMA CM: Created device context for %s port %d\n", dev->ib_devname,
+		       node->cma_id->port_num);
+	}
+
+	// Prepare connection context
+	conn.type = CONN_TYPE_RDMA_CM;
+	conn.u.cm.node = node;
+	conn.dev = dev;
+	conn.client_idx = -1;
+
+	// Find available client index
+	for (int i = 0; i < MAX_CLIENTS; ++i) {
+		if (dev->fd_to_client_idx[i] == -1) {
+			conn.client_idx = i;
+			dev->fd_to_client_idx[i] = i; // Mark as used
+			break;
+		}
+	}
+	if (conn.client_idx < 0) {
+		printf("No free client index slots available for RDMA CM\n");
+		goto err;
+	}
+
+	// Allocate PD if needed
+	if (!dev->client_pds[conn.client_idx]) {
+		dev->client_pds[conn.client_idx] = ibv_alloc_pd(dev->dev_ctx);
+		if (!dev->client_pds[conn.client_idx]) {
+			printf("Couldn't allocate PD for RDMA CM connection\n");
+			goto err;
+		}
+	}
+
+	// Initialize QPs using the unified function
+	ret = rdma_mq_init_unified(&conn);
+	if (ret < 0) {
+		printf("Failed to initialize QPs for RDMA CM connection\n");
+		goto err;
+	}
+
+	// Mark node as initialized to prevent re-processing
+	node->initialized = 1;
+
+	printf("RDMA CM connection established and integrated with threading system\n");
+	return 0;
+
+err:
+	cm_connect_error();
+	return -1;
+}
+
+static int
+cm_resolved_handler(struct cm_node *node, struct rdma_cm_event *event)
+{
+	int ret;
+
+	if (g_ctx.qp_type == IBV_QPT_UD) {
+		node->remote_qpn = event->param.ud.qp_num;
+		node->remote_qkey = event->param.ud.qkey;
+		node->ah = ibv_create_ah(node->pd, &event->param.ud.ah_attr);
+		if (!node->ah) {
+			printf("rdma_cm: failure creating address handle\n");
+			goto err;
+		}
+	}
+
+	node->connected = 1;
+	cm_test.connects_left--;
+
+	/* For RC client: read server MR from REP private_data */
+	if (!g_ctx.is_server && g_ctx.qp_type == IBV_QPT_RC &&
+	    event->param.conn.private_data_len >= sizeof(struct cm_private_exchange)) {
+		const struct cm_private_exchange *peer =
+			(const struct cm_private_exchange *)event->param.conn.private_data;
+		if (peer->magic == CM_EXCH_MAGIC) {
+			node->remote_rkey_cm = peer->rkey;
+			node->remote_addr_cm = peer->addr;
+			node->mr_info_valid = 1;
+		}
+	}
+
+	/* For RC server: manual QP INIT->RTR->RTS */
+	if (g_ctx.is_server && g_ctx.qp_type == IBV_QPT_RC && node->cma_id->qp) {
+		struct ibv_qp_attr qpa;
+		int qpm;
+
+		memset(&qpa, 0, sizeof(qpa));
+		qpa.qp_state = IBV_QPS_RTR;
+		ret = rdma_init_qp_attr(node->cma_id, &qpa, &qpm);
+		/* octep_rdma ibv_query_qp returns zeros -- override with sane defaults */
+		if (qpa.max_dest_rd_atomic == 0)
+			qpa.max_dest_rd_atomic = 1;
+		if (qpa.min_rnr_timer == 0)
+			qpa.min_rnr_timer = 12;
+		if (ret == 0)
+			ret = ibv_modify_qp(node->cma_id->qp, &qpa, qpm);
+
+		memset(&qpa, 0, sizeof(qpa));
+		qpa.qp_state = IBV_QPS_RTS;
+		ret = rdma_init_qp_attr(node->cma_id, &qpa, &qpm);
+		/* octep_rdma ibv_query_qp returns zeros -- override with sane defaults */
+		if (qpa.timeout == 0)
+			qpa.timeout = 14;
+		if (qpa.retry_cnt == 0)
+			qpa.retry_cnt = 7;
+		if (qpa.rnr_retry == 0)
+			qpa.rnr_retry = 7;
+		if (qpa.max_rd_atomic == 0)
+			qpa.max_rd_atomic = 1;
+		if (ret == 0)
+			ret = ibv_modify_qp(node->cma_id->qp, &qpa, qpm);
+	}
+
+	ret = cm_integrate_connection(node);
+	if (ret < 0)
+		goto err;
+
+	return 0;
+
+err:
+	cm_connect_error();
+	return -1;
+}
+
+static int
+cm_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
+{
+	int ret = 0;
+
+	printf("[DEBUG] RDMA CM event: %s\n", rdma_event_str(event->event));
+
+	switch (event->event) {
+	case RDMA_CM_EVENT_ADDR_RESOLVED:
+		ret = cm_addr_handler(cma_id->context);
+		break;
+	case RDMA_CM_EVENT_ROUTE_RESOLVED:
+		ret = cm_route_handler(cma_id->context);
+		break;
+	case RDMA_CM_EVENT_CONNECT_REQUEST:
+		ret = cm_connect_handler(cma_id, event);
+		break;
+	case RDMA_CM_EVENT_ESTABLISHED:
+		ret = cm_resolved_handler(cma_id->context, event);
+		break;
+	case RDMA_CM_EVENT_ADDR_ERROR:
+	case RDMA_CM_EVENT_ROUTE_ERROR:
+	case RDMA_CM_EVENT_CONNECT_ERROR:
+	case RDMA_CM_EVENT_UNREACHABLE:
+	case RDMA_CM_EVENT_REJECTED:
+		printf("rdma_cm: event: %s, error: %d\n", rdma_event_str(event->event),
+		       event->status);
+		cm_connect_error();
+		ret = event->status;
+		break;
+	case RDMA_CM_EVENT_DEVICE_REMOVAL:
+		/* Cleanup will occur after test completes. */
+		break;
+	default:
+		break;
+	}
+	return ret;
+}
+
+static void
+cm_destroy_node(struct cm_node *node)
+{
+	if (!node->cma_id)
+		return;
+
+	if (node->ah)
+		ibv_destroy_ah(node->ah);
+
+	if (node->cma_id->qp)
+		rdma_destroy_qp(node->cma_id);
+
+	if (node->cq)
+		ibv_destroy_cq(node->cq);
+
+	if (node->data_mr) {
+		ibv_dereg_mr(node->data_mr);
+		node->data_mr = NULL;
+	}
+	if (node->data_buf) {
+		free(node->data_buf);
+		node->data_buf = NULL;
+	}
+
+	if (node->mem) {
+		ibv_dereg_mr(node->mr);
+		free(node->mem);
+	}
+
+	if (node->pd)
+		ibv_dealloc_pd(node->pd);
+
+	/* Destroy the RDMA ID after all device resources */
+	rdma_destroy_id(node->cma_id);
+}
+
+static int
+cm_alloc_nodes(void)
+{
+	int ret, i;
+
+	cm_test.nodes = malloc(sizeof(*cm_test.nodes) * g_ctx.num_client);
+	if (!cm_test.nodes) {
+		printf("rdma_cm: unable to allocate memory for test nodes\n");
+		return -ENOMEM;
+	}
+	memset(cm_test.nodes, 0, sizeof(*cm_test.nodes) * g_ctx.num_client);
+
+	for (i = 0; i < g_ctx.num_client; i++) {
+		cm_test.nodes[i].id = i;
+		if (g_ctx.servername) {
+			ret = rdma_create_id(cm_test.channel, &cm_test.nodes[i].cma_id,
+					     &cm_test.nodes[i], hints.ai_port_space);
+			if (ret)
+				goto err;
+		}
+	}
+	return 0;
+err:
+	while (--i >= 0)
+		rdma_destroy_id(cm_test.nodes[i].cma_id);
+	free(cm_test.nodes);
+	return ret;
+}
+
+static void
+cm_destroy_nodes(void)
+{
+	int i;
+
+	for (i = 0; i < g_ctx.num_client; i++)
+		cm_destroy_node(&cm_test.nodes[i]);
+	free(cm_test.nodes);
+}
+
+/* Background thread to watch for CM disconnect events after connection setup.
+ * For server in WRITE/READ mode, the server is passive and needs to know
+ * when the client disconnects so it can exit cleanly. */
+static void *
+cm_disconnect_watcher(void *arg)
+{
+	struct rdma_cm_event *event;
+	(void)arg;
+
+	while (1) {
+		if (rdma_get_cm_event(cm_test.channel, &event))
+			break;
+		printf("[CM-WATCHER] Event: %s\n", rdma_event_str(event->event));
+		if (event->event == RDMA_CM_EVENT_DISCONNECTED) {
+			rdma_ack_cm_event(event);
+			printf("[CM-WATCHER] Client disconnected, setting force_quit\n");
+			g_ctx.force_quit = true;
+			break;
+		}
+		rdma_ack_cm_event(event);
+	}
+	return NULL;
+}
+
+static int
+cm_connect_events(void)
+{
+	struct rdma_cm_event *event;
+	int ret = 0;
+
+	printf("[DEBUG] Starting event loop, connects_left=%d\n", cm_test.connects_left);
+	while (cm_test.connects_left && !ret) {
+		printf("[DEBUG] Waiting for RDMA CM event (connects_left=%d)\n",
+		       cm_test.connects_left);
+		ret = rdma_get_cm_event(cm_test.channel, &event);
+		if (!ret) {
+			ret = cm_handler(event->id, event);
+			rdma_ack_cm_event(event);
+			printf("[DEBUG] Event processed, connects_left=%d, ret=%d\n",
+			       cm_test.connects_left, ret);
+		} else {
+			printf("[DEBUG] rdma_get_cm_event failed: ret=%d\n", ret);
+		}
+	}
+	printf("[DEBUG] Event loop exited, connects_left=%d, ret=%d\n", cm_test.connects_left, ret);
+	return ret;
+}
+
+static int
+cm_run_server(void)
+{
+	struct rdma_cm_id *listen_id;
+	int ret;
+
+	printf("rdma_cm: starting server\n");
+	ret = rdma_create_id(cm_test.channel, &listen_id, &cm_test, hints.ai_port_space);
+	if (ret) {
+		perror("rdma_cm: listen request failed");
+		return ret;
+	}
+
+	/* For server mode, use NULL as destination and let RDMA CM handle the address */
+	printf("rdma_cm: getting address for port %s\n", g_ctx.port ? g_ctx.port : "NULL");
+	ret = get_rdma_addr(g_ctx.src_addr, NULL, g_ctx.port, &hints, &cm_test.rai);
+	if (ret) {
+		printf("rdma_cm: get_rdma_addr failed with ret=%d\n", ret);
+		goto out;
+	}
+
+	printf("rdma_cm: binding to address\n");
+	ret = rdma_bind_addr(listen_id, cm_test.rai->ai_src_addr);
+	if (ret) {
+		perror("rdma_cm: bind address failed");
+		printf("rdma_cm: bind failed with ret=%d\n", ret);
+		goto out;
+	}
+
+	ret = rdma_listen(listen_id, 0);
+	if (ret) {
+		perror("rdma_cm: failure trying to listen");
+		goto out;
+	}
+
+	printf("rdma_cm: waiting for connections...\n");
+	ret = cm_connect_events();
+	if (ret)
+		goto out;
+
+	printf("rdma_cm: server connected successfully\n");
+
+	/* Start background thread to watch for CM disconnect events */
+	{
+		pthread_t watcher_tid;
+
+		if (pthread_create(&watcher_tid, NULL, cm_disconnect_watcher, NULL) == 0)
+			pthread_detach(watcher_tid);
+	}
+
+out:
+	rdma_destroy_id(listen_id);
+	return ret;
+}
+
+static int
+cm_run_client(void)
+{
+	int i, ret;
+
+	printf("rdma_cm: starting client\n");
+	printf("rdma_cm: resolving address for server=%s, port=%s\n",
+	       g_ctx.servername ? g_ctx.servername : "NULL", g_ctx.port ? g_ctx.port : "NULL");
+
+	ret = get_rdma_addr(g_ctx.src_addr, g_ctx.servername, g_ctx.port, &hints, &cm_test.rai);
+	if (ret) {
+		printf("rdma_cm: get_rdma_addr failed with ret=%d\n", ret);
+		return ret;
+	}
+
+	printf("rdma_cm: connecting\n");
+	for (i = 0; i < 1; i++) { /* Connect one connection for now */
+		ret = rdma_resolve_addr(cm_test.nodes[i].cma_id, cm_test.rai->ai_src_addr,
+					cm_test.rai->ai_dst_addr, 2000);
+		if (ret) {
+			perror("rdma_cm: failure getting addr");
+			cm_connect_error();
+			return ret;
+		}
+	}
+
+	ret = cm_connect_events();
+	if (ret)
+		goto out;
+
+	printf("rdma_cm: client connected successfully\n");
+
+	/* Start background thread to watch for CM disconnect events */
+	{
+		pthread_t watcher_tid;
+
+		if (pthread_create(&watcher_tid, NULL, cm_disconnect_watcher, NULL) == 0)
+			pthread_detach(watcher_tid);
+	}
+
+out:
+	return ret;
 }
 
 static int
@@ -584,7 +1490,17 @@ rdma_cleanup_client_pd(struct device_ctx *dev, int client_idx)
 static int
 rdma_cleanup(struct qp_data *qdata)
 {
-	printf("Cleaning up QP %u device cleanup\n", qdata->local_info.qp_num);
+	// Check if already cleaned up
+	if (qdata->cleaned_up) {
+		printf("QP %u already cleaned up, skipping\n", qdata->local_info.qp_num);
+		return 0;
+	}
+
+	printf("Cleaning up QP %u device cleanup (qdata=%p, qp=%p, ctx=%p)\n",
+	       qdata->local_info.qp_num, qdata, qdata->qp, qdata->qp ? qdata->qp->context : NULL);
+
+	// Mark as being cleaned up to prevent concurrent cleanup
+	qdata->cleaned_up = 1;
 
 	qdata->armed = 0;
 
@@ -596,7 +1512,9 @@ rdma_cleanup(struct qp_data *qdata)
 	qdata->cq = NULL;
 	qdata->send_cq = NULL;
 
-	if (qp) {
+	/* For RDMA CM QPs, cm_destroy_nodes() handles QP/CQ destruction.
+	 * The QP/CQ may already be freed, so skip modify and drain. */
+	if (qp && !qdata->is_rdma_cm) {
 		struct ibv_qp_attr attr = {.qp_state = IBV_QPS_ERR};
 
 		if (ibv_modify_qp(qp, &attr, IBV_QP_STATE))
@@ -604,27 +1522,49 @@ rdma_cleanup(struct qp_data *qdata)
 			       qdata->local_info.qp_num);
 	}
 
-	if (cq) {
+	if (cq && !qdata->is_rdma_cm) {
 		struct ibv_wc wc;
 
 		while (ibv_poll_cq(cq, 1, &wc) > 0)
 			;
 	}
-	if (scq) {
+	if (scq && !qdata->is_rdma_cm) {
 		struct ibv_wc wc;
 
 		while (ibv_poll_cq(scq, 1, &wc) > 0)
 			;
 	}
 
-	if (qp && ibv_destroy_qp(qp)) {
-		printf("Couldn't destroy QP\n");
-		return -1;
+	// Only destroy manually created QPs, not RDMA CM QPs
+	if (qp && !qdata->is_rdma_cm) {
+		// This is a manually created QP (TCP mode), safe to destroy
+		if (ibv_destroy_qp(qp)) {
+			printf("Couldn't destroy QP\n");
+			return -1;
+		}
+		if (g_ctx.debug)
+			printf("[DEBUG] Destroyed manual QP %u\n", qdata->local_info.qp_num);
+	} else if (qp) {
+		// This is an RDMA CM QP, don't destroy it manually
+		printf("[DEBUG] Skipping QP destroy for RDMA CM QP %u (managed by librdmacm)\n",
+		       qdata->local_info.qp_num);
 	}
 
-	if (cq && ibv_destroy_cq(cq)) {
-		printf("Couldn't destroy CQ\n");
-		return -1;
+	if (cq) {
+		if (qdata->is_cq_rdma_cm) {
+			// This is an RDMA CM CQ, don't destroy it manually
+			printf("[DEBUG] Skipping CQ destroy for RDMA CM CQ %p (managed by librdmacm)\n",
+			       (void *)cq);
+		} else {
+			// This is a manually created CQ, destroy it
+			if (ibv_destroy_cq(cq)) {
+				printf("Couldn't destroy CQ\n");
+				return -1;
+			}
+			if (g_ctx.debug) {
+				printf("[DEBUG] Destroyed manual CQ %p\n", (void *)cq);
+			}
+		}
 	}
 	if (scq && ibv_destroy_cq(scq)) {
 		printf("Couldn't destroy send CQ\n");
@@ -646,9 +1586,18 @@ rdma_cleanup(struct qp_data *qdata)
 		free(qdata->buf_arr);
 	}
 
-	if (qdata->ah && ibv_destroy_ah(qdata->ah)) {
-		printf("Couldn't destroy AH\n");
-		return -1;
+	// Only destroy manually created AHs, not RDMA CM AHs
+	if (qdata->ah && !qdata->is_ah_rdma_cm) {
+		if (ibv_destroy_ah(qdata->ah)) {
+			printf("Couldn't destroy AH\n");
+			return -1;
+		}
+		if (g_ctx.debug)
+			printf("[DEBUG] Destroyed manual AH\n");
+	} else if (qdata->ah) {
+		// RDMA CM AH is managed by librdmacm, don't destroy manually
+		if (g_ctx.debug)
+			printf("[DEBUG] Skipping AH destroy for RDMA CM AH (managed by librdmacm)\n");
 	}
 
 	/* Per-client PD is cleaned up on disconnect or at program exit. */
@@ -749,8 +1698,67 @@ post_recv(struct qp_data *qdata, int rxdepth, int wr_id)
 	recv_wr.sg_list = &recv_sge_arr[0];
 	recv_wr.num_sge = g_ctx.nb_sge;
 
+	// Debug validation before posting
+	if (!qdata->qp) {
+		printf("ERROR: QP is NULL in post recv\n");
+		return 0;
+	}
+	if (!qdata->qp->context) {
+		printf("ERROR: QP context is NULL in post recv\n");
+		return 0;
+	}
+
+	// Check memory regions
+	for (int sge_idx = 0; sge_idx < g_ctx.nb_sge; ++sge_idx) {
+		if (!qdata->mr_arr[sge_idx]) {
+			printf("ERROR: Memory region %d is NULL in post recv\n", sge_idx);
+			return 0;
+		}
+		if (!qdata->buf_arr[sge_idx]) {
+			printf("ERROR: Buffer %d is NULL in post recv\n", sge_idx);
+			return 0;
+		}
+	}
+
+	// For manually created UD QPs in RESET state, transition to INIT if needed
+	if (!qdata->is_rdma_cm && g_ctx.qp_type == IBV_QPT_UD) {
+		struct ibv_qp_attr qp_attr;
+		struct ibv_qp_init_attr qp_init_attr;
+
+		if (ibv_query_qp(qdata->qp, &qp_attr, IBV_QP_STATE, &qp_init_attr) == 0) {
+			if (qp_attr.qp_state == IBV_QPS_RESET) {
+				struct ibv_qp_attr init_attr = {0};
+
+				init_attr.qp_state = IBV_QPS_INIT;
+				init_attr.port_num = 1;
+				init_attr.pkey_index = 0;
+				init_attr.qkey = 0x11111111;
+
+				int init_mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+						IBV_QP_QKEY;
+
+				if (ibv_modify_qp(qdata->qp, &init_attr, init_mask)) {
+					if (g_ctx.debug)
+						printf("[WARNING] Failed to transition UD QP %u to INIT state\n",
+						       qdata->qp->qp_num);
+				} else if (g_ctx.debug) {
+					printf("[DEBUG] Successfully transitioned UD QP %u to INIT state\n",
+					       qdata->qp->qp_num);
+				}
+			}
+		}
+	}
+
 	for (j = 0; j < rxdepth; j++) {
-		if (ibv_post_recv(qdata->qp, &recv_wr, &bad_recv)) {
+		int ret = ibv_post_recv(qdata->qp, &recv_wr, &bad_recv);
+
+		if (ret) {
+			printf("Error posting receive buffer for QP %d: %s (errno=%d)\n",
+			       qdata->local_info.qp_num, strerror(ret), ret);
+			if (bad_recv) {
+				printf("  Bad WR: wr_id=%lu, num_sge=%d, sg_list=%p\n",
+				       bad_recv->wr_id, bad_recv->num_sge, bad_recv->sg_list);
+			}
 			qdata->stats.recv_wr_failed++;
 			break;
 		}
@@ -763,50 +1771,10 @@ post_recv(struct qp_data *qdata, int rxdepth, int wr_id)
 int
 rdma_mq_init(int csock, struct device_ctx *dev)
 {
-	int (*func_ptr)(int sock, struct qp_info *local, struct qp_info *remote);
-	struct ibv_port_attr port_attr = {0};
-	struct ibv_qp_init_attr attr = {0};
-	struct ibv_qp_attr attr_mod = {0};
-	struct ibv_ah_attr ah_attr = {0};
-	enum ibv_qp_attr_mask flags = 0;
-	struct qp_data *data;
-	int wr_id = 0;
-	char lgid[INET6_ADDRSTRLEN];
-	char rgid[INET6_ADDRSTRLEN];
-	int i, j, n;
-
-	// If server, receive conn_params from client and set QP/op type and num_pkts
-	if (g_ctx.is_server) {
-		struct conn_params params;
-
-		if (recv_conn_params(csock, &params) < 0) {
-			printf("[ERROR] Failed to receive conn_params from client\n");
-			return -1;
-		}
-		g_ctx.qp_type = params.qp_type;
-		g_ctx.op_type = params.op_type;
-		g_ctx.num_pkts = params.num_pkts;
-		g_ctx.msg_size = params.msg_size;
-		g_ctx.numqp = params.numqp; // Set number of QPs from client
-		g_ctx.num_pkt_set = 1;
-	} else {
-		// Send conn_params to server
-		struct conn_params params = {.qp_type = g_ctx.qp_type,
-					     .op_type = g_ctx.op_type,
-					     .num_pkts = g_ctx.num_pkts,
-					     .msg_size = g_ctx.msg_size,
-					     .numqp = g_ctx.numqp};
-		if (send_conn_params(csock, &params) < 0) {
-			printf("[ERROR] Failed to send conn_params to server\n");
-			return -1;
-		}
-		// make_socket_non_blocking(csock);
-	}
-	/* Track of QP count per client is not maintained in this build. */
-
-	/* Retrieve or assign a compact client index for this fd */
+	struct conn_ctx conn;
 	int client_idx = -1;
 
+	/* Retrieve or assign a compact client index for this fd */
 	if (csock >= 0 && csock < MAX_CLIENTS)
 		client_idx = dev->fd_to_client_idx[csock];
 	if (client_idx < 0) {
@@ -825,6 +1793,7 @@ rdma_mq_init(int csock, struct device_ctx *dev)
 		if (csock >= 0 && csock < MAX_CLIENTS)
 			dev->fd_to_client_idx[csock] = client_idx;
 	}
+
 	if (!dev->client_pds[client_idx]) {
 		dev->client_pds[client_idx] = ibv_alloc_pd(dev->dev_ctx);
 		if (!dev->client_pds[client_idx]) {
@@ -834,25 +1803,96 @@ rdma_mq_init(int csock, struct device_ctx *dev)
 		}
 	}
 
-	/*
-	 * Ensure we have enough free slots to host this client's QPs.
-	 * Worker threads from a previous client may still be cleaning up
-	 * (rdma_cleanup runs asynchronously in the worker); give them a
-	 * brief window (up to ~2 s) before rejecting the new connection.
-	 */
-	{
-		int wait_retries = 0;
+	/* Setup connection context for TCP */
+	conn.type = CONN_TYPE_TCP;
+	conn.u.tcp.csock = csock;
+	conn.dev = dev;
+	conn.client_idx = client_idx;
 
-		while (count_free_slots() < g_ctx.numqp && wait_retries++ < 200)
-			usleep(10000);
-		if (count_free_slots() < g_ctx.numqp) {
-			printf("Not enough free QP slots available (need %d, have %d)\n",
-			       g_ctx.numqp, count_free_slots());
-			return -1;
+	/* Use the unified initialization function */
+	return rdma_mq_init_unified(&conn);
+}
+
+/* Unified initialization function that works with both TCP and RDMA CM connections */
+int
+rdma_mq_init_unified(struct conn_ctx *conn)
+{
+	struct conn_params params;
+	struct ibv_port_attr port_attr = {0};
+	struct ibv_qp_init_attr attr = {0};
+	struct ibv_qp_attr attr_mod = {0};
+	struct ibv_ah_attr ah_attr = {0};
+	enum ibv_qp_attr_mask flags = 0;
+	struct qp_data *data;
+	int wr_id = 0;
+	char lgid[INET6_ADDRSTRLEN];
+	char rgid[INET6_ADDRSTRLEN];
+	int i, j, n;
+	struct device_ctx *dev = conn->dev;
+	int client_idx = conn->client_idx;
+
+	if (g_ctx.debug) {
+		static int call_count;
+
+		call_count++;
+		printf("DEBUG: #%d for %s connection\n", call_count,
+		       conn->type == CONN_TYPE_RDMA_CM ? "RDMA_CM" : "TCP");
+	}
+
+	// Handle connection parameter exchange (skip for RDMA CM)
+	if (conn->type == CONN_TYPE_RDMA_CM) {
+		printf("[DEBUG] RDMA CM: Skipping parameter exchange, using local g_ctx values\n");
+		params.qp_type = g_ctx.qp_type;
+		params.op_type = g_ctx.op_type;
+		params.num_pkts = g_ctx.num_pkts;
+		params.msg_size = g_ctx.msg_size;
+		params.numqp = g_ctx.numqp;
+	} else {
+		// TCP parameter exchange
+		if (g_ctx.is_server) {
+			if (unified_recv_conn_params(conn, &params) < 0) {
+				printf("[ERROR] Failed to receive conn_params\n");
+				return -1;
+			}
+			if (g_ctx.debug) {
+				printf("[DEBUG] Server received params: qp_type=%d, op_type=%d, num_pkts=%d, msg_size=%d, numqp=%d\n",
+				       params.qp_type, params.op_type, params.num_pkts,
+				       params.msg_size, params.numqp);
+			}
+			g_ctx.qp_type = params.qp_type;
+			g_ctx.op_type = params.op_type;
+			g_ctx.num_pkts = params.num_pkts;
+			g_ctx.msg_size = params.msg_size;
+			g_ctx.numqp = params.numqp;
+			g_ctx.num_pkt_set = 1;
+		} else {
+			params.qp_type = g_ctx.qp_type;
+			params.op_type = g_ctx.op_type;
+			params.num_pkts = g_ctx.num_pkts;
+			params.msg_size = g_ctx.msg_size;
+			params.numqp = g_ctx.numqp;
+			if (unified_send_conn_params(conn, &params) < 0) {
+				printf("[ERROR] Failed to send conn_params\n");
+				return -1;
+			}
 		}
 	}
 
-	for (i = 0; i < g_ctx.numqp; i++) {
+	// Ensure we have enough free slots
+	if (count_free_slots() < g_ctx.numqp) {
+		printf("Not enough free QP slots available (need %d, have %d)\n", g_ctx.numqp,
+		       count_free_slots());
+		return -1;
+	}
+
+	int qp_count = (conn->type == CONN_TYPE_RDMA_CM) ? 1 : g_ctx.numqp;
+
+	if (g_ctx.debug) {
+		printf("[DEBUG] Creating %d QP data structures for %s connection\n", qp_count,
+		       (conn->type == CONN_TYPE_RDMA_CM ? "RDMA_CM" : "TCP"));
+	}
+
+	for (i = 0; i < qp_count; i++) {
 		int slot = find_free_slot();
 
 		if (slot < 0) {
@@ -862,34 +1902,55 @@ rdma_mq_init(int csock, struct device_ctx *dev)
 
 		data = (struct qp_data *)calloc(1, sizeof(struct qp_data));
 		if (data == NULL) {
-			printf("Failed to allocate memory for thread\n");
+			printf("Failed to allocate memory for qp_data\n");
 			return -1;
 		}
 
-		/* Track the device this QP belongs to for proper cleanup */
 		data->dev = dev;
 
-		data->csock = csock;
+		// Set connection info based on type
+		switch (conn->type) {
+		case CONN_TYPE_TCP:
+			data->csock = conn->u.tcp.csock;
+			break;
+		case CONN_TYPE_RDMA_CM:
+			data->csock = -1; // No socket for RDMA CM
+			break;
+		}
+
 		data->dir = g_ctx.dir;
 
-		data->cq = ibv_create_cq(dev->dev_ctx, g_ctx.rx_depth + 1, NULL, NULL, 0);
-		if (!data->cq) {
-			printf("CQ create failed for thread\n");
-			goto cleanup;
-		}
-		if (g_ctx.separate_cq) {
-			data->send_cq =
-				ibv_create_cq(dev->dev_ctx, g_ctx.max_send_wr + 1, NULL, NULL, 0);
-			if (!data->send_cq) {
-				printf("Send CQ create failed for thread\n");
+		// Create or use CQ based on connection type
+		if (conn->type == CONN_TYPE_RDMA_CM && conn->u.cm.node && conn->u.cm.node->cq) {
+			// For RDMA CM, use the existing CQ from CM node
+			data->cq = conn->u.cm.node->cq;
+			data->is_cq_rdma_cm = 1; // Mark CQ as RDMA CM managed
+			if (g_ctx.debug)
+				printf("[DEBUG] Using RDMA CM CQ %p from CM node\n",
+				       (void *)data->cq);
+		} else {
+			// For TCP connections create new CQ(s)
+			data->cq = ibv_create_cq(dev->dev_ctx, g_ctx.rx_depth + 1, NULL, NULL, 0);
+			data->is_cq_rdma_cm = 0;
+			if (!data->cq) {
+				printf("CQ create failed\n");
 				goto cleanup;
 			}
+			if (g_ctx.separate_cq) {
+				data->send_cq = ibv_create_cq(dev->dev_ctx, g_ctx.max_send_wr + 1,
+							      NULL, NULL, 0);
+				if (!data->send_cq) {
+					printf("Send CQ create failed\n");
+					goto cleanup;
+				}
+			}
+			if (g_ctx.debug)
+				printf("[DEBUG] Created %s CQ %p (rx_depth %u) on dev %s\n",
+				       g_ctx.separate_cq ? "separate send+recv" : "shared",
+				       (void *)data->cq, g_ctx.rx_depth + 1, dev->ib_devname);
 		}
-		if (g_ctx.debug)
-			printf("[DEBUG] Created %s CQ on dev %s\n",
-			       g_ctx.separate_cq ? "separate send+recv" : "shared",
-			       dev->ib_devname);
 
+		// Allocate and register memory
 		data->buf_arr = calloc(g_ctx.nb_sge, sizeof(void *));
 		data->mr_arr = calloc(g_ctx.nb_sge, sizeof(struct ibv_mr *));
 		if (!data->buf_arr || !data->mr_arr) {
@@ -907,12 +1968,17 @@ rdma_mq_init(int csock, struct device_ctx *dev)
 			memset((char *)data->buf_arr[sge_idx] + 40,
 			       g_ctx.op_type != IBV_WR_RDMA_READ ? 0x66 : 0x77, g_ctx.msg_size);
 
-			printf("Registering MR for SGE %d: buf %p, size %u\n", sge_idx,
-			       data->buf_arr[sge_idx], g_ctx.msg_size + 40);
+			// Use the correct PD based on connection type
+			struct ibv_pd *pd_to_use;
+
+			if (conn->type == CONN_TYPE_RDMA_CM && conn->u.cm.node &&
+			    conn->u.cm.node->pd)
+				pd_to_use = conn->u.cm.node->pd;
+			else
+				pd_to_use = dev->client_pds[client_idx];
 
 			data->mr_arr[sge_idx] =
-				ibv_reg_mr(dev->client_pds[client_idx], data->buf_arr[sge_idx],
-					   g_ctx.msg_size + 40,
+				ibv_reg_mr(pd_to_use, data->buf_arr[sge_idx], g_ctx.msg_size + 40,
 					   IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
 						   IBV_ACCESS_REMOTE_READ);
 			if (!data->mr_arr[sge_idx]) {
@@ -923,139 +1989,226 @@ rdma_mq_init(int csock, struct device_ctx *dev)
 
 		data->mr = data->mr_arr[0];
 
-		attr.send_cq = data->send_cq ? data->send_cq : data->cq;
-		attr.recv_cq = data->cq;
-		attr.cap.max_send_wr = g_ctx.max_send_wr;
-		attr.cap.max_recv_wr = g_ctx.rx_depth;
-		attr.cap.max_send_sge = g_ctx.nb_sge;
-		attr.cap.max_recv_sge = g_ctx.nb_sge;
-		attr.qp_type = g_ctx.qp_type;
-		if (g_ctx.inline_thresh > 0)
-			attr.cap.max_inline_data = g_ctx.inline_thresh;
-		data->qp = ibv_create_qp(dev->client_pds[client_idx], &attr);
-		if (!data->qp) {
-			printf("Error creating QP for queue: %d\n", g_ctx.qpcount + i);
-			goto cleanup;
+		// Create QP - use RDMA CM QP if available, otherwise create manually
+		if (conn->type == CONN_TYPE_RDMA_CM && conn->u.cm.node && conn->u.cm.node->cma_id) {
+			// For RDMA CM, check if QP already exists
+			if (conn->u.cm.node->cma_id->qp) {
+				data->qp = conn->u.cm.node->cma_id->qp;
+				data->is_rdma_cm = 1; // Mark as RDMA CM QP
+				printf("[INFO] Using existing RDMA CM QP %u\n", data->qp->qp_num);
+			} else {
+				printf("[ERROR] RDMA CM QP not found\n");
+				goto cleanup;
+			}
+		} else {
+			// Create QP manually for TCP connections
+			attr.send_cq = data->send_cq ? data->send_cq : data->cq;
+			attr.recv_cq = data->cq;
+			attr.cap.max_send_wr = g_ctx.max_send_wr;
+			attr.cap.max_recv_wr = g_ctx.rx_depth;
+			attr.cap.max_send_sge = g_ctx.nb_sge;
+			attr.cap.max_recv_sge = g_ctx.nb_sge;
+			attr.qp_type = g_ctx.qp_type;
+			if (g_ctx.inline_thresh > 0)
+				attr.cap.max_inline_data = g_ctx.inline_thresh;
+
+			data->qp = ibv_create_qp(dev->client_pds[client_idx], &attr);
+			if (!data->qp) {
+				printf("Error creating QP for queue: %d\n", i);
+				goto cleanup;
+			}
+
+			data->is_rdma_cm = 0; // Mark as manually created QP
+			printf("[INFO] Created manual QP %u\n", data->qp->qp_num);
+
+			// Initialize QP state for manually created QPs
+			get_qp_modify_attr(&attr_mod, &flags, IBV_QPS_INIT, data);
+			if (ibv_modify_qp(data->qp, &attr_mod, flags)) {
+				printf("Error modifying QP %u to INIT state\n", data->qp->qp_num);
+				goto cleanup;
+			}
 		}
 
-		/* Initialize QP state */
-		get_qp_modify_attr(&attr_mod, &flags, IBV_QPS_INIT, data);
-		if (ibv_modify_qp(data->qp, &attr_mod, flags)) {
-			printf("Error modifying QP %u to INIT state\n", data->qp->qp_num);
-			goto cleanup;
-		}
 		if (g_ctx.debug)
-			printf("[DEBUG] QP %u moved to INIT\n", data->qp->qp_num);
+			printf("[DEBUG] QP %u initialized\n", data->qp->qp_num);
 
+		// Set up local QP info
 		data->local_info.qp_num = data->qp->qp_num;
-		/* Compute sgid index that matches this connection's local IP */
-		char local_ip_sel[INET_ADDRSTRLEN] = {0};
-		struct sockaddr_in laddr = {0};
-		socklen_t laddrlen = sizeof(laddr);
-
-		if (getsockname(csock, (struct sockaddr *)&laddr, &laddrlen) == 0)
-			inet_ntop(AF_INET, &laddr.sin_addr, local_ip_sel, sizeof(local_ip_sel));
-
-		int sgid_index = choose_gid_index_for_local(dev->dev_ctx, dev->ib_devname, 1,
-							    local_ip_sel[0] ? local_ip_sel : NULL,
-							    g_ctx.gidx);
-		/* Store globally for helper paths that still consult g_ctx.gidx */
-		g_ctx.gidx = sgid_index;
-
-		if (ibv_query_gid(dev->dev_ctx, 1, sgid_index, &data->local_info.gid)) {
-			printf("query gid failed\n");
-			goto cleanup;
-		}
-
-		ibv_query_port(dev->dev_ctx, 1, &port_attr);
-		data->local_info.lid = port_attr.lid;
-
-		data->local_info.psn = rand() & 0xffffff;
 		data->local_info.rkey = data->mr->rkey;
-		data->local_info.remote_addr = (uintptr_t)data->buf_arr[0] + 40; // Remote address
-										 // for write/read
+		data->local_info.remote_addr = (uintptr_t)data->buf_arr[0] + 40;
 
-		func_ptr = g_ctx.is_server ? recv_remote_info : tcp_exchange_info;
-		if (func_ptr(csock, &data->local_info, &data->remote_info) < 0) {
-			printf("Error exchanging information for QP %u line %u\n",
-			       data->local_info.qp_num, __LINE__);
+		// Handle GID and LID setup
+		if (conn->type == CONN_TYPE_TCP) {
+			// For TCP connections, get local IP from socket
+			char local_ip_sel[INET_ADDRSTRLEN] = {0};
+			struct sockaddr_in laddr = {0};
+			socklen_t laddrlen = sizeof(laddr);
+
+			if (getsockname(conn->u.tcp.csock, (struct sockaddr *)&laddr, &laddrlen) ==
+			    0)
+				inet_ntop(AF_INET, &laddr.sin_addr, local_ip_sel,
+					  sizeof(local_ip_sel));
+
+			int sgid_index =
+				choose_gid_index_for_local(dev->dev_ctx, dev->ib_devname, 1,
+							   local_ip_sel[0] ? local_ip_sel : NULL,
+							   g_ctx.gidx);
+			g_ctx.gidx = sgid_index;
+
+			if (ibv_query_gid(dev->dev_ctx, 1, sgid_index, &data->local_info.gid)) {
+				printf("query gid failed\n");
+				goto cleanup;
+			}
+
+			ibv_query_port(dev->dev_ctx, 1, &port_attr);
+			data->local_info.lid = port_attr.lid;
+			data->local_info.psn = rand() & 0xffffff;
+		} else {
+			// For RDMA CM, GID info is handled by CM
+			memset(&data->local_info.gid, 0, sizeof(data->local_info.gid));
+			data->local_info.lid = 0;
+			data->local_info.psn = 0;
+		}
+
+		// Exchange QP information
+		if (unified_exchange_qp_info(conn, &data->local_info, &data->remote_info) < 0) {
+			printf("Error exchanging QP information for QP %u\n",
+			       data->local_info.qp_num);
 			goto cleanup;
 		}
 
-		inet_ntop(AF_INET6, &data->local_info.gid, lgid, sizeof(lgid));
-		inet_ntop(AF_INET6, &data->remote_info.gid, rgid, sizeof(rgid));
-		printf("  local address: QPN 0x%06x, GID %s buf address %p len %u -- remote address: QPN 0x%06x, GID %s buf address %p len %u remote rkey %x\n",
-		       data->local_info.qp_num, lgid, (void *)data->local_info.remote_addr,
-		       g_ctx.msg_size, data->remote_info.qp_num, rgid,
-		       (void *)data->remote_info.remote_addr, g_ctx.msg_size,
-		       data->remote_info.rkey);
+		// QP state transitions and AH setup
+		if (conn->type == CONN_TYPE_TCP) {
+			inet_ntop(AF_INET6, &data->local_info.gid, lgid, sizeof(lgid));
+			inet_ntop(AF_INET6, &data->remote_info.gid, rgid, sizeof(rgid));
+			printf("  local address: QPN 0x%06x, GID %s -- remote address: QPN 0x%06x, GID %s\n",
+			       data->local_info.qp_num, lgid, data->remote_info.qp_num, rgid);
 
-		get_qp_modify_attr(&attr_mod, &flags, IBV_QPS_RTR, data);
-		if (ibv_modify_qp(data->qp, &attr_mod, flags)) {
-			printf("Error modifying QP %u to RTR state\n", data->qp->qp_num);
-			goto cleanup;
-		}
-		if (g_ctx.debug)
-			printf("[DEBUG] QP %u moved to RTR\n", data->qp->qp_num);
-
-		wr_id = g_ctx.op_type == IBV_WR_SEND      ? RDMA_UD_RECV :
-			g_ctx.op_type == IBV_WR_RDMA_READ ? RDMA_READ_REQ :
-							    RDMA_WRITE_REQ;
-		/* Post receives for UD, and for RC when op-type is SEND */
-		if (g_ctx.qp_type == IBV_QPT_UD ||
-		    (g_ctx.qp_type == IBV_QPT_RC && g_ctx.op_type == IBV_WR_SEND))
-			j = post_recv(data, g_ctx.rx_depth - 1, wr_id);
-		else
-			j = 0;
-		if (j == 0) {
-			if (g_ctx.qp_type == IBV_QPT_UD ||
-			    (g_ctx.qp_type == IBV_QPT_RC && g_ctx.op_type == IBV_WR_SEND)) {
-				printf("Error posting receive buffer. Cleaning up..\n");
+			get_qp_modify_attr(&attr_mod, &flags, IBV_QPS_RTR, data);
+			if (ibv_modify_qp(data->qp, &attr_mod, flags)) {
+				printf("Error modifying QP %u to RTR state\n", data->qp->qp_num);
 				goto cleanup;
 			}
 			if (g_ctx.debug)
-				printf("[DEBUG] Skipped posting recvs for RC QP %u (op %d)\n",
-				       data->qp->qp_num, g_ctx.op_type);
-		}
+				printf("[DEBUG] QP %u moved to RTR\n", data->qp->qp_num);
 
-		if (g_ctx.is_server && send_local_info(csock, &data->local_info) < 0) {
-			printf("Error exchanging information for QP %u line %u\n",
-			       data->local_info.qp_num, __LINE__);
-			goto cleanup;
-		}
-
-		get_qp_modify_attr(&attr_mod, &flags, IBV_QPS_RTS, data);
-		if (ibv_modify_qp(data->qp, &attr_mod, flags)) {
-			printf("Error modifying QP %u to RTS state\n", data->qp->qp_num);
-			goto cleanup;
-		}
-		if (g_ctx.debug) {
-			printf("[DEBUG] QP %u moved to RTS\n", data->qp->qp_num);
-			struct ibv_qp_attr qs = {0};
-			struct ibv_qp_init_attr qia = {0};
-
-			if (ibv_query_qp(data->qp, &qs,
-					 IBV_QP_STATE | IBV_QP_CUR_STATE | IBV_QP_QKEY |
-						 IBV_QP_PATH_MTU | IBV_QP_DEST_QPN,
-					 &qia) == 0) {
-				printf("[DEBUG] QP %u state=%d path_mtu=%d dest_qpn=%u\n",
-				       data->qp->qp_num, qs.qp_state, qs.path_mtu, qs.dest_qp_num);
-			}
-		}
-
-		if (g_ctx.qp_type == IBV_QPT_UD) {
-			ah_attr.is_global = 1;
-			ah_attr.port_num = 1;
-			ah_attr.grh.dgid = data->remote_info.gid;
-			ah_attr.grh.sgid_index = sgid_index;
-			ah_attr.grh.hop_limit = 8;
-			data->ah = ibv_create_ah(dev->client_pds[client_idx], &ah_attr);
-			if (!data->ah) {
-				printf("AH create failed\n");
+			// Send local info for server
+			if (g_ctx.is_server && unified_send_qp_info(conn, &data->local_info) < 0) {
+				printf("Error sending QP info for QP %u\n",
+				       data->local_info.qp_num);
 				goto cleanup;
 			}
+
+			get_qp_modify_attr(&attr_mod, &flags, IBV_QPS_RTS, data);
+			if (ibv_modify_qp(data->qp, &attr_mod, flags)) {
+				printf("Error modifying QP %u to RTS state\n", data->qp->qp_num);
+				goto cleanup;
+			}
+			if (g_ctx.debug)
+				printf("[DEBUG] QP %u moved to RTS\n", data->qp->qp_num);
+
+			// Create AH for UD
+			if (g_ctx.qp_type == IBV_QPT_UD) {
+				ah_attr.is_global = 1;
+				ah_attr.port_num = 1;
+				ah_attr.grh.dgid = data->remote_info.gid;
+				ah_attr.grh.sgid_index = g_ctx.gidx;
+				ah_attr.grh.hop_limit = 8;
+				data->ah = ibv_create_ah(dev->client_pds[client_idx], &ah_attr);
+				if (!data->ah) {
+					printf("AH create failed\n");
+					goto cleanup;
+				}
+				data->is_ah_rdma_cm = 0; // Mark as manually created AH
+
+				// Set remote qkey for TCP UD connections
+				data->remote_qkey = 0x11111111;
+				if (g_ctx.debug) {
+					printf("[DEBUG] TCP UD QP %u: AH=%p, remote QPN=%u, remote_qkey=0x%x\n",
+					       data->qp->qp_num, data->ah, data->remote_info.qp_num,
+					       data->remote_qkey);
+				}
+			}
+		} else if (conn->type == CONN_TYPE_RDMA_CM) {
+			// For RDMA CM, check connection is established
+			if (!conn->u.cm.node || !conn->u.cm.node->connected) {
+				printf("ERROR: RDMA CM connection not yet established\n");
+				goto cleanup;
+			}
+
+			// For RDMA CM, use the AH from the CM node
+			if (g_ctx.qp_type == IBV_QPT_UD && conn->u.cm.node && conn->u.cm.node->ah) {
+				data->ah = conn->u.cm.node->ah;
+				data->is_ah_rdma_cm = 1; // Mark as RDMA CM managed AH
+				data->remote_info.qp_num = conn->u.cm.node->remote_qpn;
+				data->remote_qkey = conn->u.cm.node->remote_qkey;
+				printf("[DEBUG] UD QP %u: AH=%p, remote QPN=%u, remote_qkey=0x%x\n",
+				       data->qp->qp_num, data->ah, data->remote_info.qp_num,
+				       conn->u.cm.node->remote_qkey);
+			} else if (g_ctx.qp_type == IBV_QPT_RC && conn->u.cm.node->mr_info_valid) {
+				/* Use MR info from CM private_data */
+				data->remote_info.rkey = conn->u.cm.node->remote_rkey_cm;
+				data->remote_info.remote_addr = conn->u.cm.node->remote_addr_cm;
+				if (conn->u.cm.node->data_mr) {
+					data->local_info.rkey = conn->u.cm.node->data_mr->rkey;
+					data->local_info.remote_addr =
+						conn->u.cm.node->exchange_addr;
+				}
+				printf("[INFO] RC CM: MR via private_data:"
+				       " local rkey=0x%x addr=0x%lx"
+				       " remote rkey=0x%x addr=0x%lx\n",
+				       data->local_info.rkey, data->local_info.remote_addr,
+				       data->remote_info.rkey, data->remote_info.remote_addr);
+			}
+			printf("  RDMA CM QP %u connected (remote QPN %u)\n",
+			       data->local_info.qp_num, data->remote_info.qp_num);
 		}
 
+		// Post receives if needed
+		wr_id = g_ctx.op_type == IBV_WR_SEND      ? RDMA_UD_RECV :
+			g_ctx.op_type == IBV_WR_RDMA_READ ? RDMA_READ_REQ :
+							    RDMA_WRITE_REQ;
+
+		bool should_post_recv =
+			(g_ctx.qp_type == IBV_QPT_UD ||
+			 (g_ctx.qp_type == IBV_QPT_RC && g_ctx.op_type == IBV_WR_SEND));
+
+		if (should_post_recv && conn->type == CONN_TYPE_RDMA_CM) {
+			// For RDMA CM, check if receives have already been posted for this QP
+			bool recv_already_posted = false;
+
+			for (int check_slot = 0; check_slot < slot; check_slot++) {
+				if (g_ctx.qp_data[check_slot] && g_ctx.qp_data[check_slot]->qp &&
+				    g_ctx.qp_data[check_slot]->qp->qp_num == data->qp->qp_num &&
+				    g_ctx.qp_data[check_slot]->rcnt > 0) {
+					recv_already_posted = true;
+					break;
+				}
+			}
+
+			if (recv_already_posted) {
+				printf("[INFO] Receives already posted for RDMA CM QP %u, skipping\n",
+				       data->qp->qp_num);
+				j = g_ctx.rx_depth - 1;
+			} else {
+				j = post_recv(data, g_ctx.rx_depth - 1, wr_id);
+				if (j > 0) {
+					printf("[INFO] Posted %d receive buffers for RDMA CM QP %u\n",
+					       j, data->qp->qp_num);
+				}
+			}
+		} else if (should_post_recv) {
+			j = post_recv(data, g_ctx.rx_depth - 1, wr_id);
+		} else {
+			j = 0;
+		}
+
+		if (j == 0 && should_post_recv) {
+			printf("Error posting receive buffer. Cleaning up..\n");
+			goto cleanup;
+		}
+
+		// Initialize remaining fields
 		data->pending = (g_ctx.op_type == IBV_WR_SEND && data->dir != RDMA_UD_SEND) ?
 					RDMA_UD_RECV :
 					0;
@@ -1068,6 +2221,13 @@ rdma_mq_init(int csock, struct device_ctx *dev)
 		data->deferred_echo = 0;
 
 		g_ctx.qp_data[slot] = data;
+
+		// Immediately mark this slot as active in the bitmap
+		if (!atomic_bitmap_is_set(slot)) {
+			atomic_bitmap_set(slot);
+			printf("[INFO] Immediately marked QP slot %d as active for QP %u\n", slot,
+			       data->qp->qp_num);
+		}
 		continue;
 
 	cleanup:
@@ -1078,10 +2238,14 @@ rdma_mq_init(int csock, struct device_ctx *dev)
 
 	n = i;
 	// Mark the slots we just filled as active in the bitmap
-	for (int idx = 0, marked = 0; idx < g_ctx.total_slots && marked < n; ++idx) {
+	int limit = g_ctx.total_slots > 0 ? g_ctx.total_slots : MAX_QUEUES;
+
+	for (int idx = 0, marked = 0; idx < limit && marked < n; ++idx) {
 		if (g_ctx.qp_data[idx] && !atomic_bitmap_is_set(idx)) {
 			atomic_bitmap_set(idx);
 			marked++;
+			printf("[INFO] Marked QP slot %d as active in bitmap for QP %u\n", idx,
+			       g_ctx.qp_data[idx]->qp->qp_num);
 		}
 	}
 
@@ -1108,7 +2272,15 @@ post_send(struct qp_data *qdata, int wr_id, int opcode)
 	send_wr.wr_id = wr_id;
 	send_wr.sg_list = &send_sge_arr[0];
 	send_wr.num_sge = g_ctx.nb_sge;
-	send_wr.opcode = opcode;
+	// For RDMA CM UD, use SEND_WITH_IMM to send our QP number in immediate data
+	if (qdata->is_rdma_cm && g_ctx.qp_type == IBV_QPT_UD && opcode == IBV_WR_SEND) {
+		send_wr.opcode = IBV_WR_SEND_WITH_IMM;
+		send_wr.imm_data = htobe32(qdata->local_info.qp_num);
+	} else {
+		send_wr.opcode = opcode;
+		send_wr.imm_data = 0x44333377;
+	}
+
 	// Signal rate limiting
 	qdata->send_posted_count++;
 	if (g_ctx.signal_every <= 1 || (qdata->send_posted_count % g_ctx.signal_every) == 0)
@@ -1117,12 +2289,11 @@ post_send(struct qp_data *qdata, int wr_id, int opcode)
 	// Inline when small and supported
 	if (g_ctx.inline_thresh > 0 && (int)g_ctx.msg_size <= g_ctx.inline_thresh)
 		send_wr.send_flags |= IBV_SEND_INLINE;
-	send_wr.imm_data = 0x44333377;
 
 	if (g_ctx.qp_type == IBV_QPT_UD) {
 		send_wr.wr.ud.ah = qdata->ah;
 		send_wr.wr.ud.remote_qpn = qdata->remote_info.qp_num;
-		send_wr.wr.ud.remote_qkey = 0x11111111;
+		send_wr.wr.ud.remote_qkey = qdata->remote_qkey;
 	} else {
 		if (opcode == IBV_WR_RDMA_READ || opcode == IBV_WR_RDMA_WRITE ||
 		    opcode == IBV_WR_RDMA_WRITE_WITH_IMM) {
@@ -1490,8 +2661,10 @@ rdma_mq_thread(void *arg)
 
 		if (!g_ctx.is_server && g_ctx.num_pkt_set &&
 		    rdma_check_all_qp_num_pkt_count(tq_range)) {
-			printf("All QP's have completed sending packets. Exiting thread %d\n",
+			printf("   All QP's in Thread %d have completed sending packets successfully!\n",
 			       tq_range->tindex);
+			printf("   QP Range: %d-%d | Total Messages Sent: %d per QP\n",
+			       tq_range->start_qp, tq_range->end_qp, g_ctx.num_pkts);
 			goto done;
 		}
 
@@ -1502,7 +2675,9 @@ rdma_mq_thread(void *arg)
 	}
 
 done:
-	printf("Thread index: %d exiting.\n", tq_range->tindex);
+	printf("Worker Thread %d completed successfully!\n", tq_range->tindex);
+	printf("  - Processed QP range: %d-%d\n", tq_range->start_qp, tq_range->end_qp);
+	printf("  - Thread index: %d exiting\n", tq_range->tindex);
 
 	return NULL;
 }
@@ -1572,6 +2747,9 @@ static struct option long_options[] = {{.name = "gid-idx", .has_arg = 1, .val = 
 				       {.name = "signal-every", .has_arg = 1, .val = 6},
 				       {.name = "inline", .has_arg = 1, .val = 7},
 				       {.name = "pingpong", .has_arg = 0, .val = 8},
+				       {.name = "rdma-cm", .has_arg = 0, .val = 12},
+				       {.name = "src-addr", .has_arg = 1, .val = 13},
+				       {.name = "cm-port", .has_arg = 1, .val = 14},
 				       {.name = "no-pingpong", .has_arg = 0, .val = 9},
 				       {.name = "stats", .has_arg = 0, .val = 10},
 				       {.name = "separate-cq", .has_arg = 0, .val = 11},
@@ -1697,6 +2875,15 @@ parse_command_line(int argc, char *argv[])
 			break;
 		case 11:
 			g_ctx.separate_cq = true;
+			break;
+		case 12:
+			g_ctx.use_rdma_cm = true;
+			break;
+		case 13:
+			g_ctx.src_addr = strdup(optarg);
+			break;
+		case 14:
+			g_ctx.port = strdup(optarg);
 			break;
 		default:
 			usage(argv[0]);
@@ -1993,120 +3180,233 @@ rdma_dump_stats(void)
 	printf("Per-QP details: %s\n", filename);
 }
 
-int
-main(int argc, char **argv)
+/* RDMA CM initialization and connection setup */
+static int
+init_rdma_cm(void)
 {
-	struct epoll_event events[MAX_EVENTS];
-	struct ibv_device **dev_list = NULL;
-	struct ibv_device *ib_dev;
-	struct qp_range *range;
-	struct qp_data *qdata;
-	int available_cpus;
-	pthread_t *threads;
-	int subset_size;
-	int qp_id = 0;
-	int epoll_fd;
-	int cclient;
-	int csock;
-	int i;
-	int csock_fds[MAX_EVENTS] = {0}; // Track csock fds
-	int csock_count = 0;
+	printf("Using RDMA CM for connections\n");
 
-	/* Program can run as server with no positional args, or as client with a hostname */
+	/* Update hints based on QP type and mode (server/client) */
+	if (g_ctx.qp_type == IBV_QPT_RC)
+		hints.ai_port_space = RDMA_PS_TCP;
+	else if (g_ctx.qp_type == IBV_QPT_UD)
+		hints.ai_port_space = RDMA_PS_UDP;
 
-	signal(SIGINT, signal_handler);
-	signal(SIGTERM, signal_handler);
+	/* Set proper flags based on server/client mode */
+	if (g_ctx.servername)
+		hints.ai_flags = 0;
+	else
+		hints.ai_flags = RAI_PASSIVE;
 
-	rdma_init_default();
+	printf("RDMA CM: Using port space %s for QP type %s, mode: %s\n",
+	       (hints.ai_port_space == RDMA_PS_TCP) ? "TCP" : "UDP",
+	       (g_ctx.qp_type == IBV_QPT_RC) ? "RC" : "UD", g_ctx.servername ? "CLIENT" : "SERVER");
 
-	available_cpus = sysconf(_SC_NPROCESSORS_ONLN);
-	if (g_ctx.max_cpu_cores >= available_cpus) {
-		fprintf(stderr,
-			"Warning: Reducing g_ctx.max_cpu_cores (%d) "
-			"to available CPUs (%d)\n",
-			g_ctx.max_cpu_cores, available_cpus);
-		g_ctx.max_cpu_cores = available_cpus;
-	}
-	if (g_ctx.min_cpu_cores >= g_ctx.max_cpu_cores)
-		g_ctx.min_cpu_cores = 0;
-	g_ctx.max_num_threads = g_ctx.max_cpu_cores - g_ctx.min_cpu_cores;
-
-	parse_command_line(argc, argv);
-
-	if (g_ctx.numqp == -1 || g_ctx.numqp == 0)
-		g_ctx.numqp = DEF_NUM_QPS;
-
-	if (g_ctx.num_threads == -1 || g_ctx.num_threads == 0 ||
-	    g_ctx.num_threads > g_ctx.max_num_threads) {
-		printf("Defaulting max number if threads equal to cpu cores: %d\n",
-		       g_ctx.max_num_threads);
-		g_ctx.num_threads = g_ctx.max_num_threads;
+	cm_test.connects_left = 1; /* Expect one connection */
+	cm_test.channel = create_event_channel();
+	if (!cm_test.channel) {
+		printf("Failed to create RDMA CM event channel\n");
+		return -1;
 	}
 
-	if (optind == argc - 1)
-		g_ctx.servername = strdup(argv[optind]);
+	if (cm_alloc_nodes()) {
+		printf("Failed to allocate RDMA CM nodes\n");
+		rdma_destroy_event_channel(cm_test.channel);
+		return -1;
+	}
 
-	g_ctx.is_server = g_ctx.servername ? 0 : 1;
+	printf("RDMA CM infrastructure initialized successfully\n");
 
-	if (g_ctx.num_client == -1 || g_ctx.num_client == 0 || g_ctx.servername)
-		g_ctx.num_client = 1;
+	/* Initialize available IB devices for threading system */
+	struct ibv_device **dev_list = ibv_get_device_list(NULL);
 
-	dev_list = ibv_get_device_list(NULL);
 	if (!dev_list) {
+		printf("No IB devices found for RDMA CM\n");
+		return -1;
+	}
+
+	if (!dev_list[0]) {
+		printf("No IB devices available for RDMA CM\n");
+		ibv_free_device_list(dev_list);
+		return -1;
+	}
+
+	struct device_ctx *dev = &g_devices[0];
+
+	dev->dev_ctx = ibv_open_device(dev_list[0]);
+	if (!dev->dev_ctx) {
+		printf("Failed to open IB device for RDMA CM\n");
+		ibv_free_device_list(dev_list);
+		return -1;
+	}
+
+	dev->ib_devname = strdup(ibv_get_device_name(dev_list[0]));
+	dev->ip_list = NULL;
+	dev->ip_count = 0;
+
+	for (int k = 0; k < MAX_CLIENTS; ++k) {
+		dev->client_pds[k] = NULL;
+		dev->fd_to_client_idx[k] = -1;
+	}
+
+	g_num_devices = 1;
+	g_ctx.dev_ctx = dev->dev_ctx;
+
+	printf("RDMA CM: Initialized device %s for threading system\n", dev->ib_devname);
+	ibv_free_device_list(dev_list);
+
+	return 0;
+}
+
+/* TCP device enumeration and setup */
+static int
+init_tcp_devices(struct ibv_device ***dev_list, struct ibv_device **ib_dev)
+{
+	int i;
+
+	*dev_list = ibv_get_device_list(NULL);
+	if (!*dev_list) {
 		printf("Dev list get failed\n");
 		return -1;
 	}
 
 	if (!g_ctx.ib_devname) {
 		printf("No IB device specified, using first available device\n");
-		ib_dev = *dev_list;
-		g_ctx.ib_devname = strdup(ibv_get_device_name(ib_dev));
-		if (!ib_dev) {
+		*ib_dev = **dev_list;
+		g_ctx.ib_devname = strdup(ibv_get_device_name(*ib_dev));
+		if (!*ib_dev) {
 			printf("No IB devices found\n");
 			return -1;
 		}
 	} else {
-		for (i = 0; dev_list[i]; ++i)
-			if (!strcmp(ibv_get_device_name(dev_list[i]), g_ctx.ib_devname))
+		for (i = 0; (*dev_list)[i]; ++i)
+			if (!strcmp(ibv_get_device_name((*dev_list)[i]), g_ctx.ib_devname))
 				break;
-		ib_dev = dev_list[i];
-		if (!ib_dev) {
+		*ib_dev = (*dev_list)[i];
+		if (!*ib_dev) {
 			printf("IB device %s not found\n", g_ctx.ib_devname);
 			return -1;
 		}
 	}
+
 	if (enumerate_ib_devices_and_ips() < 0) {
 		printf("Failed to enumerate IB devices and IPs\n");
 		return -1;
 	}
 
-	g_ctx.dev_ctx = ibv_open_device(ib_dev);
+	g_ctx.dev_ctx = ibv_open_device(*ib_dev);
 	if (!g_ctx.dev_ctx) {
-		printf("Couldn't get context for %s\n", ibv_get_device_name(ib_dev));
+		printf("Couldn't get context for %s\n", ibv_get_device_name(*ib_dev));
 		return -1;
 	}
 
-	range = divide_qps_among_threads(g_ctx.numqp, g_ctx.num_threads);
-	if (range == NULL)
+	return 0;
+}
+
+/* Common thread setup for both RDMA CM and TCP */
+static int
+setup_worker_threads(pthread_t **threads, struct qp_range **range)
+{
+	int i, subset_size;
+
+	*range = divide_qps_among_threads(g_ctx.numqp, g_ctx.num_threads);
+	if (*range == NULL)
 		return -1;
 
 	// Compute total QP slots from ranges
 	g_ctx.total_slots = 0;
 	for (i = 0; i < g_ctx.num_threads; ++i)
-		g_ctx.total_slots += range[i].count;
+		g_ctx.total_slots += (*range)[i].count;
 
 	subset_size = g_ctx.max_cpu_cores - g_ctx.min_cpu_cores + 1;
-	threads = malloc(sizeof(pthread_t) * g_ctx.num_threads);
+	*threads = malloc(sizeof(pthread_t) * g_ctx.num_threads);
 	for (i = 0; i < g_ctx.num_threads; i++) {
-		range[i].coreid = g_ctx.min_cpu_cores + (i % subset_size);
-		if (pthread_create(&threads[i], NULL, rdma_mq_thread, &range[i])) {
+		(*range)[i].coreid = g_ctx.min_cpu_cores + (i % subset_size);
+		if (pthread_create(&(*threads)[i], NULL, rdma_mq_thread, &(*range)[i])) {
 			printf("Failed to create thread for QP %d\n", i);
 			return -1;
 		}
 	}
 
-	cclient = 0;
+	printf("Created %d worker threads\n", g_ctx.num_threads);
+	return 0;
+}
+
+/* RDMA CM execution logic */
+static int
+run_rdma_cm(pthread_t *threads)
+{
+	int i;
+
+	printf("RDMA CM mode: Starting connections now that QP slots are allocated\n");
+
+	/* Now establish RDMA CM connections with QP slots available */
+	if (g_ctx.servername) {
+		/* Client mode */
+		if (cm_run_client() < 0) {
+			printf("RDMA CM client failed\n");
+			cm_destroy_nodes();
+			rdma_destroy_event_channel(cm_test.channel);
+			if (cm_test.rai)
+				rdma_freeaddrinfo(cm_test.rai);
+			return -1;
+		}
+	} else {
+		/* Server mode */
+		if (cm_run_server() < 0) {
+			printf("RDMA CM server failed\n");
+			cm_destroy_nodes();
+			rdma_destroy_event_channel(cm_test.channel);
+			if (cm_test.rai)
+				rdma_freeaddrinfo(cm_test.rai);
+			return -1;
+		}
+	}
+
+	printf("RDMA CM connections established successfully\n");
+	printf("RDMA CM mode: QPs ready, threads started\n");
+	g_ctx.init_done = true;
+
+	/* Wait for threads to complete */
+	for (i = 0; i < g_ctx.num_threads; i++)
+		pthread_join(threads[i], NULL);
+
+	printf("✅ All %d worker threads completed successfully!\n", g_ctx.num_threads);
+
+	/* Cleanup RDMA CM resources */
+	cm_destroy_nodes();
+	rdma_destroy_event_channel(cm_test.channel);
+	if (cm_test.rai)
+		rdma_freeaddrinfo(cm_test.rai);
+
+	printf("========================================\n");
+	printf("RDMA CM TEST COMPLETED SUCCESSFULLY!\n");
+	printf("Mode: %s\n", g_ctx.servername ? "Client" : "Server");
+	printf("QP Type: %s\n", (g_ctx.qp_type == IBV_QPT_UD) ? "UD" : "RC");
+	printf("Operation: %s\n", (g_ctx.op_type == IBV_WR_SEND)                ? "SEND" :
+				  (g_ctx.op_type == IBV_WR_RDMA_READ)           ? "READ" :
+				  (g_ctx.op_type == IBV_WR_RDMA_WRITE_WITH_IMM) ? "WRITE_WITH_IMM" :
+										  "WRITE");
+	printf("Messages: %d\n", g_ctx.num_pkts);
+	printf("Message Size: %u bytes\n", g_ctx.msg_size);
+	printf("QP Count: %d\n", g_ctx.numqp);
+	printf("Threads: %d\n", g_ctx.num_threads);
+	printf("========================================\n");
+	return 0;
+}
+
+/* TCP server/client execution logic */
+static int
+run_tcp_mode(void)
+{
+	struct epoll_event events[MAX_EVENTS];
+	int epoll_fd, cclient;
+	int csock, i;
+	int csock_fds[MAX_CLIENTS];
+	int csock_count = 0;
+
 	if (!g_ctx.servername) {
+		/* TCP Server mode */
 		epoll_fd = tcp_server_listen(TCP_PORT);
 		printf("Server listening on port %d...\n", TCP_PORT);
 
@@ -2130,7 +3430,7 @@ main(int argc, char **argv)
 					if (read(g_ctx.shutdown_fd, &val, sizeof(val)) !=
 					    sizeof(val))
 						printf("Read g_ctx.shutdown_fd failed\n");
-					goto exit;
+					goto tcp_exit;
 				}
 
 				if (fd == g_ctx.sockfd) {
@@ -2172,6 +3472,7 @@ main(int argc, char **argv)
 			// complete
 		}
 	} else {
+		/* TCP Client mode */
 		csock = tcp_connect_to_server(g_ctx.servername, TCP_PORT);
 		if (csock < 0) {
 			printf("Client socket connect error\n");
@@ -2209,7 +3510,30 @@ main(int argc, char **argv)
 		printf("Client Connected to remote\n");
 	}
 
-exit:
+tcp_exit:
+	printf("========================================\n");
+	printf("TCP TEST COMPLETED SUCCESSFULLY!\n");
+	printf("Mode: %s\n", g_ctx.servername ? "Client" : "Server");
+	printf("QP Type: %s\n", (g_ctx.qp_type == IBV_QPT_UD) ? "UD" : "RC");
+	printf("Operation: %s\n", (g_ctx.op_type == IBV_WR_SEND)                ? "SEND" :
+				  (g_ctx.op_type == IBV_WR_RDMA_READ)           ? "READ" :
+				  (g_ctx.op_type == IBV_WR_RDMA_WRITE_WITH_IMM) ? "WRITE_WITH_IMM" :
+										  "WRITE");
+	printf("Messages: %d\n", g_ctx.num_pkts);
+	printf("Message Size: %u bytes\n", g_ctx.msg_size);
+	printf("QP Count: %d\n", g_ctx.numqp);
+	printf("Threads: %d\n", g_ctx.num_threads);
+	printf("========================================\n");
+	return 0;
+}
+
+/* Cleanup function for main */
+static void
+cleanup_main(pthread_t *threads, struct ibv_device **dev_list)
+{
+	int i, qp_id;
+	struct qp_data *qdata;
+
 	for (i = 0; i < g_ctx.num_threads; i++)
 		pthread_join(threads[i], NULL);
 	free(threads);
@@ -2267,6 +3591,91 @@ exit:
 		close(g_ctx.sockfd);
 
 	free(g_ctx.servername);
+}
 
-	return 0;
+int
+main(int argc, char **argv)
+{
+	struct ibv_device **dev_list = NULL;
+	struct ibv_device *ib_dev;
+	struct qp_range *range;
+	int available_cpus;
+	pthread_t *threads;
+
+	/* Program can run as server with no positional args, or as client with a hostname */
+
+	signal(SIGINT, signal_handler);
+	signal(SIGTERM, signal_handler);
+
+	rdma_init_default();
+
+	available_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+	if (g_ctx.max_cpu_cores >= available_cpus) {
+		fprintf(stderr,
+			"Warning: Reducing g_ctx.max_cpu_cores (%d) "
+			"to available CPUs (%d)\n",
+			g_ctx.max_cpu_cores, available_cpus);
+		g_ctx.max_cpu_cores = available_cpus;
+	}
+	if (g_ctx.min_cpu_cores >= g_ctx.max_cpu_cores)
+		g_ctx.min_cpu_cores = 0;
+	g_ctx.max_num_threads = g_ctx.max_cpu_cores - g_ctx.min_cpu_cores;
+
+	parse_command_line(argc, argv);
+
+	if (g_ctx.numqp == -1 || g_ctx.numqp == 0) {
+		if (g_ctx.use_rdma_cm) {
+			g_ctx.numqp = 16; // Larger default for RDMA CM mode to accommodate dynamic
+					  // connections
+			printf("RDMA CM mode: Using default %d QP slots for dynamic connections\n",
+			       g_ctx.numqp);
+		} else {
+			g_ctx.numqp = DEF_NUM_QPS;
+		}
+	}
+
+	if (g_ctx.num_threads == -1 || g_ctx.num_threads == 0 ||
+	    g_ctx.num_threads > g_ctx.max_num_threads) {
+		printf("Defaulting max number if threads equal to cpu cores: %d\n",
+		       g_ctx.max_num_threads);
+		g_ctx.num_threads = g_ctx.max_num_threads;
+	}
+
+	if (optind == argc - 1)
+		g_ctx.servername = strdup(argv[optind]);
+
+	g_ctx.is_server = g_ctx.servername ? 0 : 1;
+
+	if (g_ctx.num_client == -1 || g_ctx.num_client == 0 || g_ctx.servername)
+		g_ctx.num_client = 1;
+
+	/* Initialize connection type - RDMA CM or TCP */
+	if (g_ctx.use_rdma_cm) {
+		if (init_rdma_cm() < 0)
+			return -1;
+	} else {
+		if (init_tcp_devices(&dev_list, &ib_dev) < 0)
+			return -1;
+	}
+
+	/* Setup worker threads - common for both RDMA CM and TCP */
+	if (setup_worker_threads(&threads, &range) < 0)
+		return -1;
+
+	/* Execute based on connection type */
+	int ret;
+
+	if (g_ctx.use_rdma_cm)
+		ret = run_rdma_cm(threads);
+	else
+		ret = run_tcp_mode();
+
+	cleanup_main(threads, dev_list);
+
+	if (ret == 0)
+		printf("\nALL TESTS COMPLETED SUCCESSFULLY!\n");
+	else
+		printf("\nTEST EXECUTION FAILED\n");
+
+	return ret;
 }

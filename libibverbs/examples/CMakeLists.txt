@@ -28,4 +28,4 @@ rdma_executable(ibv_xsrq_pingpong xsrq_pingpong.c)
 target_link_libraries(ibv_xsrq_pingpong LINK_PRIVATE ibverbs ibverbs_tools)
 
 rdma_executable(ibv_rdma_mq_trf ibv_rdma_mq_trf.c)
-target_link_libraries(ibv_rdma_mq_trf LINK_PRIVATE ibverbs ibverbs_tools)
+target_link_libraries(ibv_rdma_mq_trf LINK_PRIVATE ibverbs ibverbs_tools rdmacm)
