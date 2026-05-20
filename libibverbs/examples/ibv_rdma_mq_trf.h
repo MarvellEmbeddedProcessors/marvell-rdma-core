@@ -95,7 +95,6 @@ struct qp_data {
 	int deferred_echo;
 	struct qp_stats stats;
 	uint32_t remote_qkey;
-	struct cm_node *cm_node; /* back-pointer for UD cleanup (no DISCONNECT event) */
 };
 
 /* Connection parameters sent from client to server */

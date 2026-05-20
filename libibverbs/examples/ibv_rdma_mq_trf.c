@@ -958,11 +958,12 @@ cm_connect_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 			if (ud_peer->msg_size)
 				g_ctx.msg_size = ud_peer->msg_size;
 		}
-		/* AH will be created from the first recv WC.
-		 * event->param.ud.ah_attr is not reliably
-		 * populated for SIDR.
-		 */
+		/* Create AH from the requester's address info in the SIDR_REQ */
+		node->ah = ibv_create_ah(node->pd, &event->param.ud.ah_attr);
 		node->remote_qkey = event->param.ud.qkey;
+		if (g_ctx.debug)
+			printf("[QKEY-CHECK] srv-connect: qkey-from-event=0x%x (no fallback)\n",
+			       node->remote_qkey);
 	}
 
 	memset(&conn_param, 0, sizeof(conn_param));
@@ -999,32 +1000,6 @@ cm_connect_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 		}
 	}
 
-	/* For UD: integrate (post recv buffers) BEFORE accept/SIDR_REP.
-	 * UD has no RNR NAK or retransmission. The client sends immediately
-	 * after receiving SIDR_REP, so RQEs must already be posted and
-	 * DMA'd to FW before the REP goes on the wire.
-	 *
-	 * The server may be long-running (-c N with N >> numqp).  Worker
-	 * threads free QP slots as connections complete, so wait for a
-	 * slot to become available rather than failing immediately. */
-	if (g_ctx.qp_type == IBV_QPT_UD) {
-		while (count_free_slots() < 1 && !g_ctx.force_quit)
-			usleep(1000);
-		if (g_ctx.force_quit)
-			goto err2;
-		node->connected = 1;
-		cm_test.connects_left--;
-		ret = cm_integrate_connection(node);
-		if (ret < 0) {
-			printf("[ERROR] UD pre-accept integration failed\n");
-			goto err2;
-		}
-	}
-
-	if (g_ctx.qp_type == IBV_QPT_UD)
-		printf("[UD-CM:SRV][4/7] rdma_accept: sending SIDR_REP with local_qpn=%u\n",
-		       node->cma_id->qp ? node->cma_id->qp->qp_num : 0);
-
 	ret = rdma_accept(node->cma_id, &conn_param);
 	if (ret) {
 		perror("rdma_cm: failure accepting");
@@ -1037,6 +1012,15 @@ cm_connect_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 	/* ucma_init_ud_qp() already transitioned the QP to RTS with
 	 * correct qkey/port.  Extra modify_qp calls (even failed ones)
 	 * corrupt octep_rdma firmware recv-path state.  Do not touch. */
+	if (g_ctx.qp_type == IBV_QPT_UD) {
+		node->connected = 1;
+		cm_test.connects_left--;
+		ret = cm_integrate_connection(node);
+		if (ret < 0) {
+			printf("[ERROR] UD integration failed\n");
+			goto err2;
+		}
+	}
 
 	return 0;
 
@@ -1363,18 +1347,14 @@ cm_destroy_node(struct cm_node *node)
 	if (!node->cma_id)
 		return;
 
-	if (node->ah) {
+	if (node->ah)
 		ibv_destroy_ah(node->ah);
-		node->ah = NULL;
-	}
 
 	if (node->cma_id->qp)
 		rdma_destroy_qp(node->cma_id);
 
-	if (node->cq) {
+	if (node->cq)
 		ibv_destroy_cq(node->cq);
-		node->cq = NULL;
-	}
 
 	if (node->data_mr) {
 		ibv_dereg_mr(node->data_mr);
@@ -1388,18 +1368,13 @@ cm_destroy_node(struct cm_node *node)
 	if (node->mem) {
 		ibv_dereg_mr(node->mr);
 		free(node->mem);
-		node->mr = NULL;
-		node->mem = NULL;
 	}
 
-	if (node->pd) {
+	if (node->pd)
 		ibv_dealloc_pd(node->pd);
-		node->pd = NULL;
-	}
 
 	/* Destroy the RDMA ID after all device resources */
 	rdma_destroy_id(node->cma_id);
-	node->cma_id = NULL;
 }
 
 static int
@@ -2310,11 +2285,7 @@ rdma_mq_init_unified(struct conn_ctx *conn)
 				goto cleanup;
 			}
 
-			// For UD RDMA CM: always set cm_node back-pointer for cleanup
-			if (g_ctx.qp_type == IBV_QPT_UD && conn->u.cm.node)
-				data->cm_node = conn->u.cm.node;
-			// For RDMA CM, use the AH from the CM node (client only;
-			// server creates AH later from first recv WC)
+			// For RDMA CM, use the AH from the CM node
 			if (g_ctx.qp_type == IBV_QPT_UD && conn->u.cm.node && conn->u.cm.node->ah) {
 				data->ah = conn->u.cm.node->ah;
 				data->is_ah_rdma_cm = 1; // Mark as RDMA CM managed AH
@@ -2490,12 +2461,6 @@ post_send(struct qp_data *qdata, int wr_id, int opcode)
 		send_wr.send_flags |= IBV_SEND_INLINE;
 
 	if (g_ctx.qp_type == IBV_QPT_UD) {
-		if (!qdata->ah) {
-			if (g_ctx.debug)
-				printf("[UD-SEND] QP %u: skipping send, AH not yet created\n",
-				       qdata->qp ? qdata->qp->qp_num : 0);
-			return 1; /* AH not ready; return > 0 so caller won't set pending */
-		}
 		send_wr.wr.ud.ah = qdata->ah;
 		send_wr.wr.ud.remote_qpn = qdata->remote_info.qp_num;
 		send_wr.wr.ud.remote_qkey = qdata->remote_qkey;
@@ -2633,12 +2598,9 @@ rdma_handle_rdma_send(struct qp_data *qdata, int tindex)
 		     g_ctx.op_type != IBV_WR_SEND) &&
 		    qdata->dir != RDMA_UD_RECV && !(qdata->pending & RDMA_UD_SEND) &&
 		    (!g_ctx.num_pkt_set || qdata->num_pkt)) {
-			int sret = post_send(qdata, RDMA_UD_SEND, IBV_WR_SEND);
-
-			if (sret < 0)
+			if (post_send(qdata, RDMA_UD_SEND, IBV_WR_SEND))
 				return -1;
-			if (sret == 0)
-				qdata->pending |= RDMA_UD_SEND;
+			qdata->pending |= RDMA_UD_SEND;
 		}
 		/* RC SEND pingpong: a RECV CQE may have arrived while a
 		 * previous echo SEND was still pending in the shared CQ.
@@ -2666,44 +2628,6 @@ rdma_handle_rdma_send(struct qp_data *qdata, int tindex)
 		}
 		qdata->stats.recv_cqe_ok++;
 		qdata->rcnt--;
-
-		/* Server UD RDMA-CM: create AH from first recv WC.
-		 * The SIDR CONNECT_REQUEST does not carry a usable ah_attr,
-		 * so we build the AH from the GRH in the received packet.
-		 * Also get qkey via ibv_query_qp since event->param.ud.qkey
-		 * may not be reliably populated.
-		 */
-		if (g_ctx.qp_type == IBV_QPT_UD && !g_ctx.servername && qdata->is_rdma_cm &&
-		    !qdata->ah) {
-			struct ibv_qp_attr qp_attr;
-			struct ibv_qp_init_attr qp_init_attr;
-
-			qdata->ah = ibv_create_ah_from_wc(qdata->qp->pd, &wc[i],
-							  (struct ibv_grh *)qdata->buf_arr[0], 1);
-			if (!qdata->ah) {
-				printf("[UD-CM][ERR] ibv_create_ah_from_wc "
-				       "failed: %s\n",
-				       strerror(errno));
-			} else if (ibv_query_qp(qdata->qp, &qp_attr, IBV_QP_QKEY, &qp_init_attr)) {
-				printf("[UD-CM][ERR] ibv_query_qp for QKEY "
-				       "failed: %s\n",
-				       strerror(errno));
-			} else {
-				qdata->remote_qkey = qp_attr.qkey;
-				/* Use src_qp from WC as remote QPN if non-zero
-				 * Falls back to the value from SIDR private_data
-				 * if src_qp=0.
-				 */
-				if (wc[i].src_qp)
-					qdata->remote_info.qp_num = wc[i].src_qp;
-				if (g_ctx.debug)
-					printf("[UD-CM] Created AH from recv WC "
-					       "(src_qp=%u byte_len=%u) "
-					       "remote_qpn=%u remote_qkey=0x%x\n",
-					       wc[i].src_qp, wc[i].byte_len,
-					       qdata->remote_info.qp_num, qdata->remote_qkey);
-			}
-		}
 
 		if (g_ctx.servername && g_ctx.pingpong && g_ctx.qp_type == IBV_QPT_RC &&
 		    g_ctx.op_type == IBV_WR_SEND && qdata->pending_echo_count > 0)
@@ -2736,12 +2660,9 @@ rdma_handle_rdma_send(struct qp_data *qdata, int tindex)
 		     g_ctx.op_type != IBV_WR_SEND) &&
 		    qdata->dir != RDMA_UD_RECV && !(qdata->pending & RDMA_UD_SEND) &&
 		    (!g_ctx.num_pkt_set || qdata->num_pkt)) {
-			int sret = post_send(qdata, RDMA_UD_SEND, IBV_WR_SEND);
-
-			if (sret < 0)
+			if (post_send(qdata, RDMA_UD_SEND, IBV_WR_SEND))
 				return -1;
-			if (sret == 0)
-				qdata->pending |= RDMA_UD_SEND;
+			qdata->pending |= RDMA_UD_SEND;
 		}
 	}
 
@@ -2901,32 +2822,9 @@ rdma_mq_thread(void *arg)
 			 * slot is NULLed first, the PD dealloc races
 			 * with still-live resources and fails.
 			 */
-			/* For UD RDMA-CM: no DISCONNECT event, so we must
-			 * clean up the cm_node (PD, QP, CQ, cma_id) here
-			 * after the worker finishes all packets. */
-			if (qdata->is_rdma_cm && qdata->cm_node && g_ctx.qp_type == IBV_QPT_UD &&
-			    g_ctx.is_server) {
-				struct cm_node *node = qdata->cm_node;
-				struct device_ctx *dev = node->dev_ctx;
-				int cidx = node->client_idx;
-
-				qdata->cm_node = NULL;
-				rdma_cleanup(qdata);
-				g_ctx.qp_data[qid] = NULL;
-				free(qdata);
-				cm_destroy_node(node);
-				if (dev && cidx >= 0 && cidx < MAX_CLIENTS) {
-					rdma_cleanup_client_pd(dev, cidx);
-					dev->fd_to_client_idx[cidx] = -1;
-				}
-				if (g_ctx.debug)
-					printf("[UD-CM:SRV] Cleaned up cm_node "
-					       "after worker completion\n");
-			} else {
-				rdma_cleanup(qdata);
-				g_ctx.qp_data[qid] = NULL;
-				free(qdata);
-			}
+			rdma_cleanup(qdata);
+			g_ctx.qp_data[qid] = NULL;
+			free(qdata);
 		}
 
 		if (!g_ctx.is_server && g_ctx.num_pkt_set &&
