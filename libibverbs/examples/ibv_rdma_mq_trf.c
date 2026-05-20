@@ -66,8 +66,6 @@ static int send_local_info(int rsock, struct qp_info *local);
 static void cm_connect_error(void);
 static int cm_alloc_nodes(void);
 static void cm_destroy_nodes(void);
-static void cm_destroy_node(struct cm_node *node);
-static void rdma_cleanup_client_pd(struct device_ctx *dev, int client_idx);
 
 /* Init functions forward declarations */
 int rdma_mq_init(int csock, struct device_ctx *dev);
@@ -737,8 +735,8 @@ cm_init_node(struct cm_node *node)
 	memset(&init_qp_attr, 0, sizeof(init_qp_attr));
 	init_qp_attr.cap.max_send_wr = g_ctx.max_send_wr;
 	init_qp_attr.cap.max_recv_wr = g_ctx.rx_depth;
-	init_qp_attr.cap.max_send_sge = g_ctx.nb_sge;
-	init_qp_attr.cap.max_recv_sge = g_ctx.nb_sge;
+	init_qp_attr.cap.max_send_sge = 1;
+	init_qp_attr.cap.max_recv_sge = 1;
 	init_qp_attr.qp_context = node;
 	init_qp_attr.sq_sig_all = 0;
 	init_qp_attr.qp_type = g_ctx.qp_type;
@@ -750,21 +748,28 @@ cm_init_node(struct cm_node *node)
 		goto out;
 	}
 
-	/*
-	 * ucma_init_ud_qp() already transitioned RESET->INIT->RTR->RTS
-	 * with kernel-returned attributes.  Do NOT re-transition here:
-	 * doing RESET from RTS corrupts octep_rdma firmware CQ state and
-	 * prevents send CQEs from being generated.  The QP is already in
-	 * RTS and ready for both send and recv operations.
-	 */
+	/* INIT->INIT re-modify: rdma_create_qp sets access_flags=0.
+	 * We must add REMOTE_WRITE + REMOTE_READ for RDMA ops to work. */
+	{
+		struct ibv_qp_attr qpa_init;
+
+		memset(&qpa_init, 0, sizeof(qpa_init));
+		qpa_init.qp_state = IBV_QPS_INIT;
+		qpa_init.qp_access_flags =
+			IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
+		qpa_init.pkey_index = 0;
+		qpa_init.port_num = node->cma_id->port_num;
+		ret = ibv_modify_qp(node->cma_id->qp, &qpa_init,
+				    IBV_QP_STATE | IBV_QP_ACCESS_FLAGS | IBV_QP_PKEY_INDEX |
+					    IBV_QP_PORT);
+	}
 	ret = cm_create_message(node);
 	if (ret) {
 		printf("rdma_cm: failed to create messages: %d\n", ret);
 		goto out;
 	}
 
-	/* Register data buffer MR with remote access for RDMA WRITE.
-	 * rkey+addr exchanged via CM private_data. */
+	/* Register data buffer MR with remote write for RDMA WRITE */
 	if (g_ctx.qp_type == IBV_QPT_RC) {
 		size_t buf_sz = g_ctx.msg_size + 40;
 
@@ -812,7 +817,6 @@ static int
 cm_route_handler(struct cm_node *node)
 {
 	struct rdma_conn_param conn_param;
-	struct cm_private_exchange client_exch;
 	int ret;
 
 	ret = cm_verify_test_params(node);
@@ -824,10 +828,10 @@ cm_route_handler(struct cm_node *node)
 		goto err;
 
 	memset(&conn_param, 0, sizeof(conn_param));
-	conn_param.responder_resources = 1;
-	conn_param.initiator_depth = 1;
+	conn_param.rnr_retry_count = 7;
 	if (g_ctx.qp_type == IBV_QPT_RC && node->data_mr) {
-		memset(&client_exch, 0, sizeof(client_exch));
+		static struct cm_private_exchange client_exch;
+
 		client_exch.addr = node->exchange_addr;
 		client_exch.rkey = node->exchange_rkey;
 		client_exch.magic = CM_EXCH_MAGIC;
@@ -840,15 +844,16 @@ cm_route_handler(struct cm_node *node)
 		/* UD/SIDR: pack client QPN + test params in SIDR_REQ private_data.
 		 * The server never gets ESTABLISHED for SIDR, so it reads these
 		 * at CONNECT_REQUEST to learn the client's QPN and test params. */
-		memset(&client_exch, 0, sizeof(client_exch));
-		client_exch.magic = CM_EXCH_MAGIC;
-		client_exch.addr = (uint64_t)node->cma_id->qp->qp_num;
-		client_exch.rkey = 0;
-		client_exch.op_type = g_ctx.op_type;
-		client_exch.num_pkts = g_ctx.num_pkts;
-		client_exch.msg_size = g_ctx.msg_size;
-		conn_param.private_data = &client_exch;
-		conn_param.private_data_len = sizeof(client_exch);
+		static struct cm_private_exchange ud_client_exch;
+
+		ud_client_exch.magic = CM_EXCH_MAGIC;
+		ud_client_exch.addr = (uint64_t)node->cma_id->qp->qp_num;
+		ud_client_exch.rkey = 0;
+		ud_client_exch.op_type = g_ctx.op_type;
+		ud_client_exch.num_pkts = g_ctx.num_pkts;
+		ud_client_exch.msg_size = g_ctx.msg_size;
+		conn_param.private_data = &ud_client_exch;
+		conn_param.private_data_len = sizeof(ud_client_exch);
 	} else {
 		conn_param.private_data = cm_test.rai->ai_connect;
 		conn_param.private_data_len = cm_test.rai->ai_connect_len;
@@ -869,37 +874,20 @@ static int cm_integrate_connection(struct cm_node *node);
 static int
 cm_connect_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 {
-	struct cm_node *node = NULL;
+	struct cm_node *node;
 	struct rdma_conn_param conn_param;
-	int saved_id, ret, si;
+	int ret;
 
-	/* Find a free node slot.  Slots are recycled by cm_disconnect_handler()
-	 * when an RDMA_CM_EVENT_DISCONNECTED event is processed, which lets the
-	 * server accept many more iterations than g_ctx.num_client. */
-	for (si = 0; si < g_ctx.num_client; si++) {
-		if (cm_test.nodes[si].cma_id == NULL && !cm_test.nodes[si].initialized) {
-			node = &cm_test.nodes[si];
-			if (si >= cm_test.conn_index)
-				cm_test.conn_index = si + 1;
-			break;
-		}
-	}
-
-	if (!node) {
+	if (cm_test.conn_index == g_ctx.num_client) {
 		ret = -ENOMEM;
 		goto err1;
 	}
-
-	/* Reset stale state from any previous use of this slot */
-	saved_id = node->id;
-	memset(node, 0, sizeof(*node));
-	node->id = saved_id;
-	node->client_idx = -1;
+	node = &cm_test.nodes[cm_test.conn_index++];
 
 	node->cma_id = cma_id;
 	cma_id->context = node;
 
-	/* Check if this connection has already been processed */
+	// Check if this connection has already been processed
 	if (node->initialized) {
 		printf("RDMA CM connection already initialized, skipping\n");
 		return 0;
@@ -961,46 +949,35 @@ cm_connect_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 		/* Create AH from the requester's address info in the SIDR_REQ */
 		node->ah = ibv_create_ah(node->pd, &event->param.ud.ah_attr);
 		node->remote_qkey = event->param.ud.qkey;
-		if (g_ctx.debug)
-			printf("[QKEY-CHECK] srv-connect: qkey-from-event=0x%x (no fallback)\n",
-			       node->remote_qkey);
+		if (!node->remote_qkey)
+			node->remote_qkey = 0x01234567; /* RDMA_UDP_QKEY default */
 	}
 
 	memset(&conn_param, 0, sizeof(conn_param));
 	conn_param.rnr_retry_count = 7;
-	conn_param.responder_resources = 1;
-	conn_param.initiator_depth = 1;
 	if (g_ctx.qp_type == IBV_QPT_UD)
 		conn_param.qp_num = node->cma_id->qp->qp_num;
 
-	/* srv_exch must outlive rdma_accept() which reads it */
-	struct cm_private_exchange srv_exch;
-	/* For RC: put server MR in REP private_data */
+	/* For RC: put server MR in REP private_data, detach QP from rdma_accept
+	 * to skip broken ucma_modify_qp_rtr/rts on octep_rdma driver. */
+	struct ibv_qp *saved_qp = NULL;
+
 	if (g_ctx.qp_type == IBV_QPT_RC && node->data_mr) {
-		memset(&srv_exch, 0, sizeof(srv_exch));
+		static struct cm_private_exchange srv_exch;
+
 		srv_exch.addr = node->exchange_addr;
 		srv_exch.rkey = node->exchange_rkey;
 		srv_exch.magic = CM_EXCH_MAGIC;
 		conn_param.private_data = &srv_exch;
 		conn_param.private_data_len = sizeof(srv_exch);
-	}
-
-	/* For RC SEND: integrate connection (post recv buffers) BEFORE accept.
-	 * The client starts sending immediately after its QP goes RTS (upon
-	 * receiving our REP).  Without recv buffers already posted, incoming
-	 * SENDs trigger RNR NAKs and may exhaust retries before the server
-	 * processes ESTABLISHED. */
-	if (g_ctx.qp_type == IBV_QPT_RC && g_ctx.op_type == IBV_WR_SEND) {
-		node->connected = 1;
-		cm_test.connects_left--;
-		ret = cm_integrate_connection(node);
-		if (ret < 0) {
-			printf("[ERROR] RC SEND pre-accept integration failed\n");
-			goto err2;
-		}
+		saved_qp = node->cma_id->qp;
+		conn_param.qp_num = saved_qp->qp_num;
+		node->cma_id->qp = NULL;
 	}
 
 	ret = rdma_accept(node->cma_id, &conn_param);
+	if (saved_qp)
+		node->cma_id->qp = saved_qp;
 	if (ret) {
 		perror("rdma_cm: failure accepting");
 		goto err2;
@@ -1009,17 +986,12 @@ cm_connect_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 	printf("RDMA CM connection request accepted (QP %u)\n",
 	       node->cma_id->qp ? node->cma_id->qp->qp_num : 0);
 
-	/* ucma_init_ud_qp() already transitioned the QP to RTS with
-	 * correct qkey/port.  Extra modify_qp calls (even failed ones)
-	 * corrupt octep_rdma firmware recv-path state.  Do not touch. */
 	if (g_ctx.qp_type == IBV_QPT_UD) {
 		node->connected = 1;
 		cm_test.connects_left--;
 		ret = cm_integrate_connection(node);
-		if (ret < 0) {
-			printf("[ERROR] UD integration failed\n");
+		if (ret < 0)
 			goto err2;
-		}
 	}
 
 	return 0;
@@ -1092,8 +1064,8 @@ cm_integrate_connection(struct cm_node *node)
 		goto err;
 	}
 
-	// Allocate PD if needed (TCP mode only; RDMA CM already has node->pd)
-	if (conn.type != CONN_TYPE_RDMA_CM && !dev->client_pds[conn.client_idx]) {
+	// Allocate PD if needed
+	if (!dev->client_pds[conn.client_idx]) {
 		dev->client_pds[conn.client_idx] = ibv_alloc_pd(dev->dev_ctx);
 		if (!dev->client_pds[conn.client_idx]) {
 			printf("Couldn't allocate PD for RDMA CM connection\n");
@@ -1107,11 +1079,6 @@ cm_integrate_connection(struct cm_node *node)
 		printf("Failed to initialize QPs for RDMA CM connection\n");
 		goto err;
 	}
-
-	// Track ownership so RDMA_CM_EVENT_DISCONNECTED can free this connection's
-	// PD/QP/CQ resources without waiting for app shutdown.
-	node->dev_ctx = dev;
-	node->client_idx = conn.client_idx;
 
 	// Mark node as initialized to prevent re-processing
 	node->initialized = 1;
@@ -1139,10 +1106,8 @@ cm_resolved_handler(struct cm_node *node, struct rdma_cm_event *event)
 		}
 	}
 
-	if (!node->connected) {
-		node->connected = 1;
-		cm_test.connects_left--;
-	}
+	node->connected = 1;
+	cm_test.connects_left--;
 
 	/* For RC client: read server MR from REP private_data */
 	if (!g_ctx.is_server && g_ctx.qp_type == IBV_QPT_RC &&
@@ -1156,12 +1121,41 @@ cm_resolved_handler(struct cm_node *node, struct rdma_cm_event *event)
 		}
 	}
 
-	ret = cm_integrate_connection(node);
-	if (ret < 0) {
-		printf("[ERROR] integration failed QP=%u\n",
-		       node->cma_id->qp ? node->cma_id->qp->qp_num : 0);
-		goto err;
+	/* For RC server: manual QP INIT->RTR->RTS */
+	if (g_ctx.is_server && g_ctx.qp_type == IBV_QPT_RC && node->cma_id->qp) {
+		struct ibv_qp_attr qpa;
+		int qpm;
+
+		memset(&qpa, 0, sizeof(qpa));
+		qpa.qp_state = IBV_QPS_RTR;
+		ret = rdma_init_qp_attr(node->cma_id, &qpa, &qpm);
+		/* octep_rdma ibv_query_qp returns zeros -- override with sane defaults */
+		if (qpa.max_dest_rd_atomic == 0)
+			qpa.max_dest_rd_atomic = 1;
+		if (qpa.min_rnr_timer == 0)
+			qpa.min_rnr_timer = 12;
+		if (ret == 0)
+			ret = ibv_modify_qp(node->cma_id->qp, &qpa, qpm);
+
+		memset(&qpa, 0, sizeof(qpa));
+		qpa.qp_state = IBV_QPS_RTS;
+		ret = rdma_init_qp_attr(node->cma_id, &qpa, &qpm);
+		/* octep_rdma ibv_query_qp returns zeros -- override with sane defaults */
+		if (qpa.timeout == 0)
+			qpa.timeout = 14;
+		if (qpa.retry_cnt == 0)
+			qpa.retry_cnt = 7;
+		if (qpa.rnr_retry == 0)
+			qpa.rnr_retry = 7;
+		if (qpa.max_rd_atomic == 0)
+			qpa.max_rd_atomic = 1;
+		if (ret == 0)
+			ret = ibv_modify_qp(node->cma_id->qp, &qpa, qpm);
 	}
+
+	ret = cm_integrate_connection(node);
+	if (ret < 0)
+		goto err;
 
 	return 0;
 
@@ -1170,133 +1164,12 @@ err:
 	return -1;
 }
 
-/*
- * Per-connection disconnect cleanup (RDMA CM equivalent of
- * cleanup_client_fd_resources for TCP).  Releases the QPs/CQs/PD/MR/AH
- * associated with a single CM connection so the slot can be recycled
- * for a future RDMA_CM_EVENT_CONNECT_REQUEST.
- */
-static void
-cm_mark_node_qp_data_for_deletion(struct cm_node *node)
-{
-	int i;
-	struct qp_data *qdata;
-	int limit = g_ctx.total_slots;
-	struct ibv_qp *node_qp = node->cma_id ? node->cma_id->qp : NULL;
-	struct ibv_pd *node_pd = NULL;
-
-	if (node->dev_ctx && node->client_idx >= 0 && node->client_idx < MAX_CLIENTS)
-		node_pd = node->dev_ctx->client_pds[node->client_idx];
-
-	if (limit < 0)
-		limit = 0;
-	if (limit > MAX_QUEUES)
-		limit = MAX_QUEUES;
-
-	for (i = 0; i < limit; i++) {
-		qdata = g_ctx.qp_data[i];
-		if (!qdata)
-			continue;
-		/* Match by either the CM-managed QP or by the per-client PD. */
-		if ((node_qp && qdata->qp == node_qp) ||
-		    (node_pd && qdata->qp && qdata->qp->pd == node_pd)) {
-			if (g_ctx.debug)
-				printf("[CM-DISC] Marking QP %u for deletion\n",
-				       qdata->local_info.qp_num);
-			qdata->delete_me = 1;
-			qdata->armed = 0;
-		}
-	}
-}
-
-static bool
-cm_node_qps_cleaned(struct cm_node *node)
-{
-	int limit = g_ctx.total_slots;
-	struct ibv_qp *node_qp = node->cma_id ? node->cma_id->qp : NULL;
-	struct ibv_pd *node_pd = NULL;
-
-	if (node->dev_ctx && node->client_idx >= 0 && node->client_idx < MAX_CLIENTS)
-		node_pd = node->dev_ctx->client_pds[node->client_idx];
-
-	if (limit > MAX_QUEUES)
-		limit = MAX_QUEUES;
-
-	for (int i = 0; i < limit; i++) {
-		struct qp_data *qd = g_ctx.qp_data[i];
-
-		if (!qd)
-			continue;
-		if (((node_qp && qd->qp == node_qp) ||
-		     (node_pd && qd->qp && qd->qp->pd == node_pd)) &&
-		    qd->delete_me)
-			return false;
-	}
-	return true;
-}
-
-static void
-cm_disconnect_handler(struct cm_node *node)
-{
-	int retries = 0;
-	struct device_ctx *dev;
-	int cidx, saved_id;
-
-	if (!node)
-		return;
-
-	if (g_ctx.debug)
-		printf("[CM-DISC] Disconnect cleanup begin (node=%p, id=%d, qp=%u)\n", (void *)node,
-		       node->id, (node->cma_id && node->cma_id->qp) ? node->cma_id->qp->qp_num : 0);
-
-	/* NOTE: Do NOT call rdma_disconnect() here -- the peer already
-	 * disconnected (we are responding to RDMA_CM_EVENT_DISCONNECTED).
-	 * Calling it again can deadlock or generate duplicate events.
-	 *
-	 * NOTE: This function MUST be invoked AFTER rdma_ack_cm_event()
-	 * for the DISCONNECTED event, since rdma_destroy_id() below frees
-	 * the cma_id that the event still references. */
-
-	/* Stop the data-path threads from polling this connection's QPs and
-	 * wait for them to release qp_data slots. */
-	cm_mark_node_qp_data_for_deletion(node);
-	while (!cm_node_qps_cleaned(node) && retries++ < 200)
-		usleep(10000);
-	if (retries >= 200)
-		if (g_ctx.debug)
-			printf("[CM-DISC] WARN: timed out waiting for QP cleanup\n");
-
-	dev = node->dev_ctx;
-	cidx = node->client_idx;
-
-	/* Release CM-owned device resources (QP, CQ, AH, MR, ID).  After this
-	 * the cma_id is destroyed and the cm_node slot is reusable. */
-	cm_destroy_node(node);
-
-	/* Release the per-client PD allocated by cm_integrate_connection() and
-	 * free the slot in fd_to_client_idx so a later connection can reuse it. */
-	if (dev && cidx >= 0 && cidx < MAX_CLIENTS) {
-		rdma_cleanup_client_pd(dev, cidx);
-		dev->fd_to_client_idx[cidx] = -1;
-	}
-
-	/* Clear node so the slot can be reused on the next CONNECT_REQUEST. */
-	saved_id = node->id;
-	memset(node, 0, sizeof(*node));
-	node->id = saved_id;
-	node->client_idx = -1;
-
-	if (g_ctx.debug)
-		printf("[CM-DISC] Disconnect cleanup done (slot id=%d freed)\n", node->id);
-}
-
 static int
 cm_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 {
 	int ret = 0;
 
-	if (g_ctx.debug)
-		printf("[DEBUG] RDMA CM event: %s\n", rdma_event_str(event->event));
+	printf("[DEBUG] RDMA CM event: %s\n", rdma_event_str(event->event));
 
 	switch (event->event) {
 	case RDMA_CM_EVENT_ADDR_RESOLVED:
@@ -1310,17 +1183,6 @@ cm_handler(struct rdma_cm_id *cma_id, struct rdma_cm_event *event)
 		break;
 	case RDMA_CM_EVENT_ESTABLISHED:
 		ret = cm_resolved_handler(cma_id->context, event);
-		break;
-	case RDMA_CM_EVENT_DISCONNECTED:
-		/* Per-connection cleanup is performed by the event loop AFTER
-		 * rdma_ack_cm_event() returns -- rdma_destroy_id() must not run
-		 * while the event still references the cma_id.  See
-		 * cm_connect_events(). */
-		ret = 0;
-		break;
-	case RDMA_CM_EVENT_TIMEWAIT_EXIT:
-		/* Final ack from the kernel after disconnect; nothing to do. */
-		ret = 0;
 		break;
 	case RDMA_CM_EVENT_ADDR_ERROR:
 	case RDMA_CM_EVENT_ROUTE_ERROR:
@@ -1391,8 +1253,6 @@ cm_alloc_nodes(void)
 
 	for (i = 0; i < g_ctx.num_client; i++) {
 		cm_test.nodes[i].id = i;
-		cm_test.nodes[i].client_idx = -1;
-		cm_test.nodes[i].dev_ctx = NULL;
 		if (g_ctx.servername) {
 			ret = rdma_create_id(cm_test.channel, &cm_test.nodes[i].cma_id,
 					     &cm_test.nodes[i], hints.ai_port_space);
@@ -1448,38 +1308,21 @@ cm_connect_events(void)
 	struct rdma_cm_event *event;
 	int ret = 0;
 
-	if (g_ctx.debug)
-		printf("[DEBUG] Starting event loop, connects_left=%d\n", cm_test.connects_left);
+	printf("[DEBUG] Starting event loop, connects_left=%d\n", cm_test.connects_left);
 	while (cm_test.connects_left && !ret) {
-		if (g_ctx.debug)
-			printf("[DEBUG] Waiting for RDMA CM event (connects_left=%d)\n",
-			       cm_test.connects_left);
+		printf("[DEBUG] Waiting for RDMA CM event (connects_left=%d)\n",
+		       cm_test.connects_left);
 		ret = rdma_get_cm_event(cm_test.channel, &event);
 		if (!ret) {
-			struct cm_node *disc_node = NULL;
-
-			/* Capture context BEFORE ack/destroy: a DISCONNECTED
-			 * event needs deferred per-connection cleanup so the
-			 * cma_id is not freed before rdma_ack_cm_event(). */
-			if (event->event == RDMA_CM_EVENT_DISCONNECTED && event->id)
-				disc_node = (struct cm_node *)event->id->context;
-
 			ret = cm_handler(event->id, event);
 			rdma_ack_cm_event(event);
-
-			if (disc_node)
-				cm_disconnect_handler(disc_node);
-			if (g_ctx.debug)
-				printf("[DEBUG] Event processed, connects_left=%d, ret=%d\n",
-				       cm_test.connects_left, ret);
+			printf("[DEBUG] Event processed, connects_left=%d, ret=%d\n",
+			       cm_test.connects_left, ret);
 		} else {
-			if (g_ctx.debug)
-				printf("[DEBUG] rdma_get_cm_event failed: ret=%d\n", ret);
+			printf("[DEBUG] rdma_get_cm_event failed: ret=%d\n", ret);
 		}
 	}
-	if (g_ctx.debug)
-		printf("[DEBUG] Event loop exited, connects_left=%d, ret=%d\n",
-		       cm_test.connects_left, ret);
+	printf("[DEBUG] Event loop exited, connects_left=%d, ret=%d\n", cm_test.connects_left, ret);
 	return ret;
 }
 
@@ -1554,7 +1397,7 @@ cm_run_client(void)
 	}
 
 	printf("rdma_cm: connecting\n");
-	for (i = 0; i < g_ctx.num_client; i++) {
+	for (i = 0; i < 1; i++) { /* Connect one connection for now */
 		ret = rdma_resolve_addr(cm_test.nodes[i].cma_id, cm_test.rai->ai_src_addr,
 					cm_test.rai->ai_dst_addr, 2000);
 		if (ret) {
@@ -1703,17 +1546,15 @@ rdma_cleanup(struct qp_data *qdata)
 			printf("[DEBUG] Destroyed manual QP %u\n", qdata->local_info.qp_num);
 	} else if (qp) {
 		// This is an RDMA CM QP, don't destroy it manually
-		if (g_ctx.debug)
-			printf("[DEBUG] Skipping QP destroy for RDMA CM QP %u (managed by librdmacm)\n",
-			       qdata->local_info.qp_num);
+		printf("[DEBUG] Skipping QP destroy for RDMA CM QP %u (managed by librdmacm)\n",
+		       qdata->local_info.qp_num);
 	}
 
 	if (cq) {
 		if (qdata->is_cq_rdma_cm) {
 			// This is an RDMA CM CQ, don't destroy it manually
-			if (g_ctx.debug)
-				printf("[DEBUG] Skipping CQ destroy for RDMA CM CQ %p (managed by librdmacm)\n",
-				       (void *)cq);
+			printf("[DEBUG] Skipping CQ destroy for RDMA CM CQ %p (managed by librdmacm)\n",
+			       (void *)cq);
 		} else {
 			// This is a manually created CQ, destroy it
 			if (ibv_destroy_cq(cq)) {
@@ -1879,6 +1720,35 @@ post_recv(struct qp_data *qdata, int rxdepth, int wr_id)
 		}
 	}
 
+	// For manually created UD QPs in RESET state, transition to INIT if needed
+	if (!qdata->is_rdma_cm && g_ctx.qp_type == IBV_QPT_UD) {
+		struct ibv_qp_attr qp_attr;
+		struct ibv_qp_init_attr qp_init_attr;
+
+		if (ibv_query_qp(qdata->qp, &qp_attr, IBV_QP_STATE, &qp_init_attr) == 0) {
+			if (qp_attr.qp_state == IBV_QPS_RESET) {
+				struct ibv_qp_attr init_attr = {0};
+
+				init_attr.qp_state = IBV_QPS_INIT;
+				init_attr.port_num = 1;
+				init_attr.pkey_index = 0;
+				init_attr.qkey = 0x11111111;
+
+				int init_mask = IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+						IBV_QP_QKEY;
+
+				if (ibv_modify_qp(qdata->qp, &init_attr, init_mask)) {
+					if (g_ctx.debug)
+						printf("[WARNING] Failed to transition UD QP %u to INIT state\n",
+						       qdata->qp->qp_num);
+				} else if (g_ctx.debug) {
+					printf("[DEBUG] Successfully transitioned UD QP %u to INIT state\n",
+					       qdata->qp->qp_num);
+				}
+			}
+		}
+	}
+
 	for (j = 0; j < rxdepth; j++) {
 		int ret = ibv_post_recv(qdata->qp, &recv_wr, &bad_recv);
 
@@ -2008,14 +1878,14 @@ rdma_mq_init_unified(struct conn_ctx *conn)
 		}
 	}
 
-	int qp_count = (conn->type == CONN_TYPE_RDMA_CM) ? 1 : g_ctx.numqp;
-
 	// Ensure we have enough free slots
-	if (count_free_slots() < qp_count) {
-		printf("Not enough free QP slots available (need %d, have %d)\n", qp_count,
+	if (count_free_slots() < g_ctx.numqp) {
+		printf("Not enough free QP slots available (need %d, have %d)\n", g_ctx.numqp,
 		       count_free_slots());
 		return -1;
 	}
+
+	int qp_count = (conn->type == CONN_TYPE_RDMA_CM) ? 1 : g_ctx.numqp;
 
 	if (g_ctx.debug) {
 		printf("[DEBUG] Creating %d QP data structures for %s connection\n", qp_count,
@@ -2125,9 +1995,7 @@ rdma_mq_init_unified(struct conn_ctx *conn)
 			if (conn->u.cm.node->cma_id->qp) {
 				data->qp = conn->u.cm.node->cma_id->qp;
 				data->is_rdma_cm = 1; // Mark as RDMA CM QP
-				if (g_ctx.debug)
-					printf("[INFO] Using existing RDMA CM QP %u\n",
-					       data->qp->qp_num);
+				printf("[INFO] Using existing RDMA CM QP %u\n", data->qp->qp_num);
 			} else {
 				printf("[ERROR] RDMA CM QP not found\n");
 				goto cleanup;
@@ -2151,8 +2019,7 @@ rdma_mq_init_unified(struct conn_ctx *conn)
 			}
 
 			data->is_rdma_cm = 0; // Mark as manually created QP
-			if (g_ctx.debug)
-				printf("[INFO] Created manual QP %u\n", data->qp->qp_num);
+			printf("[INFO] Created manual QP %u\n", data->qp->qp_num);
 
 			// Initialize QP state for manually created QPs
 			get_qp_modify_attr(&attr_mod, &flags, IBV_QPS_INIT, data);
@@ -2225,22 +2092,6 @@ rdma_mq_init_unified(struct conn_ctx *conn)
 			if (g_ctx.debug)
 				printf("[DEBUG] QP %u moved to RTR\n", data->qp->qp_num);
 
-			/* Post receives before signaling readiness to remote side.
-			 * This ensures recv buffers are ready before the remote QP
-			 * can send to us. */
-			wr_id = g_ctx.op_type == IBV_WR_SEND      ? RDMA_UD_RECV :
-				g_ctx.op_type == IBV_WR_RDMA_READ ? RDMA_READ_REQ :
-								    RDMA_WRITE_REQ;
-			if (g_ctx.qp_type == IBV_QPT_UD ||
-			    (g_ctx.qp_type == IBV_QPT_RC && g_ctx.op_type == IBV_WR_SEND)) {
-				j = post_recv(data, g_ctx.rx_depth - 1, wr_id);
-				if (j == 0) {
-					printf("Error posting receive buffer. Cleaning up..\n");
-					goto cleanup;
-				}
-				data->rcnt = j;
-			}
-
 			// Send local info for server
 			if (g_ctx.is_server && unified_send_qp_info(conn, &data->local_info) < 0) {
 				printf("Error sending QP info for QP %u\n",
@@ -2291,15 +2142,10 @@ rdma_mq_init_unified(struct conn_ctx *conn)
 				data->is_ah_rdma_cm = 1; // Mark as RDMA CM managed AH
 				data->remote_info.qp_num = conn->u.cm.node->remote_qpn;
 				data->remote_qkey = conn->u.cm.node->remote_qkey;
-				if (g_ctx.debug)
-					printf("[DEBUG] UD QP %u: AH=%p, remote QPN=%u, remote_qkey=0x%x\n",
-					       data->qp->qp_num, data->ah, data->remote_info.qp_num,
-					       conn->u.cm.node->remote_qkey);
-			} else if (g_ctx.qp_type == IBV_QPT_RC) {
-				if (!conn->u.cm.node->mr_info_valid) {
-					printf("[ERROR] RC CM: MR info not exchanged via private_data\n");
-					goto cleanup;
-				}
+				printf("[DEBUG] UD QP %u: AH=%p, remote QPN=%u, remote_qkey=0x%x\n",
+				       data->qp->qp_num, data->ah, data->remote_info.qp_num,
+				       conn->u.cm.node->remote_qkey);
+			} else if (g_ctx.qp_type == IBV_QPT_RC && conn->u.cm.node->mr_info_valid) {
 				/* Use MR info from CM private_data */
 				data->remote_info.rkey = conn->u.cm.node->remote_rkey_cm;
 				data->remote_info.remote_addr = conn->u.cm.node->remote_addr_cm;
@@ -2308,13 +2154,11 @@ rdma_mq_init_unified(struct conn_ctx *conn)
 					data->local_info.remote_addr =
 						conn->u.cm.node->exchange_addr;
 				}
-				if (g_ctx.debug)
-					printf("[INFO] RC CM: MR via private_data:"
-					       " local rkey=0x%x addr=0x%lx"
-					       " remote rkey=0x%x addr=0x%lx\n",
-					       data->local_info.rkey, data->local_info.remote_addr,
-					       data->remote_info.rkey,
-					       data->remote_info.remote_addr);
+				printf("[INFO] RC CM: MR via private_data:"
+				       " local rkey=0x%x addr=0x%lx"
+				       " remote rkey=0x%x addr=0x%lx\n",
+				       data->local_info.rkey, data->local_info.remote_addr,
+				       data->remote_info.rkey, data->remote_info.remote_addr);
 			}
 			printf("  RDMA CM QP %u connected (remote QPN %u)\n",
 			       data->local_info.qp_num, data->remote_info.qp_num);
@@ -2343,24 +2187,23 @@ rdma_mq_init_unified(struct conn_ctx *conn)
 			}
 
 			if (recv_already_posted) {
-				if (g_ctx.debug)
-					printf("[INFO] Receives already posted for RDMA CM QP %u, skipping\n",
-					       data->qp->qp_num);
+				printf("[INFO] Receives already posted for RDMA CM QP %u, skipping\n",
+				       data->qp->qp_num);
 				j = g_ctx.rx_depth - 1;
 			} else {
 				j = post_recv(data, g_ctx.rx_depth - 1, wr_id);
 				if (j > 0) {
-					if (g_ctx.debug)
-						printf("[INFO] Posted %d receive buffers for RDMA CM QP %u\n",
-						       j, data->qp->qp_num);
+					printf("[INFO] Posted %d receive buffers for RDMA CM QP %u\n",
+					       j, data->qp->qp_num);
 				}
 			}
-		} else if (should_post_recv && conn->type != CONN_TYPE_TCP) {
+		} else if (should_post_recv) {
 			j = post_recv(data, g_ctx.rx_depth - 1, wr_id);
 		} else {
 			j = 0;
 		}
-		if (j == 0 && should_post_recv && conn->type != CONN_TYPE_TCP) {
+
+		if (j == 0 && should_post_recv) {
 			printf("Error posting receive buffer. Cleaning up..\n");
 			goto cleanup;
 		}
@@ -2379,16 +2222,11 @@ rdma_mq_init_unified(struct conn_ctx *conn)
 
 		g_ctx.qp_data[slot] = data;
 
-		// For RDMA CM, immediately mark active since QPs arrive one at
-		// a time from separate CM events and workers need to see them.
-		// For TCP, defer marking until all QPs are created (bulk loop
-		// below) so workers don't drain slots faster than init fills them.
-		if (conn->type == CONN_TYPE_RDMA_CM) {
-			if (!atomic_bitmap_is_set(slot)) {
-				atomic_bitmap_set(slot);
-				printf("[INFO] Immediately marked QP slot %d as active for QP %u\n",
-				       slot, data->qp->qp_num);
-			}
+		// Immediately mark this slot as active in the bitmap
+		if (!atomic_bitmap_is_set(slot)) {
+			atomic_bitmap_set(slot);
+			printf("[INFO] Immediately marked QP slot %d as active for QP %u\n", slot,
+			       data->qp->qp_num);
 		}
 		continue;
 
@@ -2399,22 +2237,15 @@ rdma_mq_init_unified(struct conn_ctx *conn)
 	}
 
 	n = i;
-	// Mark the slots we just filled as active in the bitmap.
-	// Skip for RDMA CM since each slot is already immediately marked above,
-	// and worker threads may concurrently free qp_data entries causing races.
-	if (conn->type != CONN_TYPE_RDMA_CM) {
-		int limit = g_ctx.total_slots > 0 ? g_ctx.total_slots : MAX_QUEUES;
+	// Mark the slots we just filled as active in the bitmap
+	int limit = g_ctx.total_slots > 0 ? g_ctx.total_slots : MAX_QUEUES;
 
-		for (int idx = 0, marked = 0; idx < limit && marked < n; ++idx) {
-			struct qp_data *entry = g_ctx.qp_data[idx];
-
-			if (entry && entry->qp && !atomic_bitmap_is_set(idx)) {
-				atomic_bitmap_set(idx);
-				marked++;
-				if (g_ctx.debug)
-					printf("[INFO] Marked QP slot %d as active in bitmap for QP %u\n",
-					       idx, entry->qp->qp_num);
-			}
+	for (int idx = 0, marked = 0; idx < limit && marked < n; ++idx) {
+		if (g_ctx.qp_data[idx] && !atomic_bitmap_is_set(idx)) {
+			atomic_bitmap_set(idx);
+			marked++;
+			printf("[INFO] Marked QP slot %d as active in bitmap for QP %u\n", idx,
+			       g_ctx.qp_data[idx]->qp->qp_num);
 		}
 	}
 
@@ -2441,15 +2272,14 @@ post_send(struct qp_data *qdata, int wr_id, int opcode)
 	send_wr.wr_id = wr_id;
 	send_wr.sg_list = &send_sge_arr[0];
 	send_wr.num_sge = g_ctx.nb_sge;
-	/*
-	 * Use plain IBV_WR_SEND for all UD sends.  octep_rdma firmware
-	 * only handles UD_SEND_ONLY (opcode 0x64); it silently drops
-	 * UD_SEND_ONLY_IMM (opcode 0x65).  The immediate data feature
-	 * is not needed — the remote QPN is already known from the CM
-	 * exchange or TCP info swap.
-	 */
-	send_wr.opcode = opcode;
-	send_wr.imm_data = 0;
+	// For RDMA CM UD, use SEND_WITH_IMM to send our QP number in immediate data
+	if (qdata->is_rdma_cm && g_ctx.qp_type == IBV_QPT_UD && opcode == IBV_WR_SEND) {
+		send_wr.opcode = IBV_WR_SEND_WITH_IMM;
+		send_wr.imm_data = htobe32(qdata->local_info.qp_num);
+	} else {
+		send_wr.opcode = opcode;
+		send_wr.imm_data = 0x44333377;
+	}
 
 	// Signal rate limiting
 	qdata->send_posted_count++;
@@ -2475,8 +2305,6 @@ post_send(struct qp_data *qdata, int wr_id, int opcode)
 
 	if (ret) {
 		qdata->stats.send_wr_failed++;
-		printf("[SEND-ERR] ibv_post_send failed on QP %u: %s (ret=%d)\n",
-		       qdata->qp ? qdata->qp->qp_num : 0, strerror(ret), ret);
 		return -1;
 	}
 	qdata->stats.send_wr_posted++;
@@ -2514,6 +2342,8 @@ rdma_handle_rdma_send(struct qp_data *qdata, int tindex)
 	struct ibv_wc wc[16];
 	int ne, i;
 
+	static __thread uint64_t dbg_ticks;
+
 	if (qdata->armed == 0 || qdata->cq == NULL || qdata->qp == NULL ||
 	    (g_ctx.separate_cq && qdata->send_cq == NULL)) {
 		if (g_ctx.debug)
@@ -2549,15 +2379,10 @@ rdma_handle_rdma_send(struct qp_data *qdata, int tindex)
 			return -1;
 		}
 		for (i = 0; i < sne; i++) {
-			if (wc[i].status == IBV_WC_SUCCESS) {
+			if (wc[i].status == IBV_WC_SUCCESS)
 				qdata->stats.send_cqe_ok++;
-			} else {
+			else
 				qdata->stats.cqe_err++;
-				printf("[CQE-ERR] send_cq QP %u: status=%d (%s) wr_id=%lu opcode=%d vendor_err=0x%x\n",
-				       qdata->local_info.qp_num, wc[i].status,
-				       ibv_wc_status_str(wc[i].status), wc[i].wr_id, wc[i].opcode,
-				       wc[i].vendor_err);
-			}
 			qdata->pending &= ~(int)wc[i].wr_id;
 			/* SEND CQE cleared the pending flag; if an echo
 			 * was deferred (RECV arrived while SEND was still
@@ -2577,13 +2402,18 @@ rdma_handle_rdma_send(struct qp_data *qdata, int tindex)
 		printf("poll CQ failed %d\n", ne);
 		return -1;
 	}
+	if (g_ctx.debug && ne == 0) {
+		if ((dbg_ticks++ & 0x3fff) == 0)
+			printf("[DEBUG][T:%d] CQ poll returned 0 for QP %u (pending=%x rcnt=%d)\n",
+			       tindex, qdata->local_info.qp_num, qdata->pending, qdata->rcnt);
+	}
+
 	/*
 	 * Two-pass CQE processing: first handle SEND completions to clear
 	 * the pending flag, then handle RECV completions which may need to
 	 * post echo sends. This avoids lost echoes when a RECV CQE appears
 	 * before a SEND CQE in the same poll batch.
 	 */
-
 	for (i = 0; i < ne; i++) {
 		if (wc[i].wr_id == RDMA_UD_RECV)
 			continue;
@@ -2675,6 +2505,8 @@ rdma_handle_rdma_op(struct qp_data *qdata, int tindex, enum ibv_wr_opcode opcode
 	struct ibv_wc wc[2];
 	int ne, i;
 
+	static __thread uint64_t dbg_ticks;
+
 	if (qdata->armed == 0 || qdata->cq == NULL || qdata->qp == NULL ||
 	    (g_ctx.separate_cq && qdata->send_cq == NULL)) {
 		if (g_ctx.debug)
@@ -2697,6 +2529,13 @@ rdma_handle_rdma_op(struct qp_data *qdata, int tindex, enum ibv_wr_opcode opcode
 		printf("poll CQ failed %d\n", ne);
 		return -1;
 	}
+	if (g_ctx.debug && ne == 0) {
+		if ((dbg_ticks++ & 0x3fff) == 0)
+			printf("[DEBUG][T:%d] CQ poll returned 0 for RC QP %u (pending=%" PRIu64
+			       ")\n",
+			       tindex, qdata->local_info.qp_num, (uint64_t)qdata->pending);
+	}
+
 	for (i = 0; i < ne; i++) {
 		if (wc[i].status == IBV_WC_SUCCESS && wc[i].wr_id == wr_id) {
 			qdata->stats.send_cqe_ok++;
@@ -2759,13 +2598,6 @@ rdma_mq_thread(void *arg)
 
 	printf("[%d]tq_range->start_qp: %d\n", tq_range->tindex, tq_range->start_qp);
 	printf("[%d]tq_range->end_qp: %d\n", tq_range->tindex, tq_range->end_qp);
-
-	/* For RDMA CM client: wait until all connections are established
-	 * before processing, so that QPs fill all slots and get distributed
-	 * across all threads properly. */
-	while (g_ctx.use_rdma_cm && !g_ctx.is_server && !g_ctx.cm_connections_ready &&
-	       !g_ctx.force_quit)
-		usleep(1000);
 
 	qid = tq_range->start_qp;
 	while (!g_ctx.force_quit) {
@@ -2863,16 +2695,7 @@ divide_qps_among_threads(int total_qps, int nthreads)
 		return NULL;
 	}
 
-	int64_t total_slots;
-
-	/* For RDMA CM, each connection creates exactly 1 QP, so the total
-	 * QP count is just total_qps (which equals num_client for client).
-	 * For TCP, the server handles num_client connections each with
-	 * total_qps QPs. */
-	if (g_ctx.use_rdma_cm)
-		total_slots = (int64_t)total_qps;
-	else
-		total_slots = (int64_t)g_ctx.num_client * (int64_t)total_qps;
+	int64_t total_slots = (int64_t)g_ctx.num_client * (int64_t)total_qps;
 
 	if (total_slots > MAX_QUEUES)
 		total_slots = MAX_QUEUES;
@@ -3379,7 +3202,7 @@ init_rdma_cm(void)
 	       (hints.ai_port_space == RDMA_PS_TCP) ? "TCP" : "UDP",
 	       (g_ctx.qp_type == IBV_QPT_RC) ? "RC" : "UD", g_ctx.servername ? "CLIENT" : "SERVER");
 
-	cm_test.connects_left = g_ctx.num_client; /* Accept num_client connections (-c) */
+	cm_test.connects_left = 1; /* Expect one connection */
 	cm_test.channel = create_event_channel();
 	if (!cm_test.channel) {
 		printf("Failed to create RDMA CM event channel\n");
@@ -3543,13 +3366,10 @@ run_rdma_cm(pthread_t *threads)
 	printf("RDMA CM connections established successfully\n");
 	printf("RDMA CM mode: QPs ready, threads started\n");
 	g_ctx.init_done = true;
-	g_ctx.cm_connections_ready = true;
 
 	/* Wait for threads to complete */
-	for (i = 0; i < g_ctx.num_threads; i++) {
+	for (i = 0; i < g_ctx.num_threads; i++)
 		pthread_join(threads[i], NULL);
-		threads[i] = 0;
-	}
 
 	printf("✅ All %d worker threads completed successfully!\n", g_ctx.num_threads);
 
@@ -3714,13 +3534,9 @@ cleanup_main(pthread_t *threads, struct ibv_device **dev_list)
 	int i, qp_id;
 	struct qp_data *qdata;
 
-	if (threads) {
-		for (i = 0; i < g_ctx.num_threads; i++) {
-			if (threads[i])
-				pthread_join(threads[i], NULL);
-		}
-		free(threads);
-	}
+	for (i = 0; i < g_ctx.num_threads; i++)
+		pthread_join(threads[i], NULL);
+	free(threads);
 
 	/* Save stats for any QPs still alive (e.g. Ctrl+C path) and clean up */
 	for (qp_id = 0; qp_id < g_ctx.total_slots; qp_id++) {
@@ -3830,13 +3646,8 @@ main(int argc, char **argv)
 
 	g_ctx.is_server = g_ctx.servername ? 0 : 1;
 
-	if (g_ctx.num_client == -1 || g_ctx.num_client == 0 || g_ctx.servername) {
-		/* For RDMA CM client, we need one CM connection per QP */
-		if (g_ctx.servername && g_ctx.use_rdma_cm)
-			g_ctx.num_client = g_ctx.numqp;
-		else
-			g_ctx.num_client = 1;
-	}
+	if (g_ctx.num_client == -1 || g_ctx.num_client == 0 || g_ctx.servername)
+		g_ctx.num_client = 1;
 
 	/* Initialize connection type - RDMA CM or TCP */
 	if (g_ctx.use_rdma_cm) {

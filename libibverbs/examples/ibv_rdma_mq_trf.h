@@ -131,10 +131,6 @@ struct cm_node {
 	int mr_info_valid;
 	struct ibv_mr *data_mr;
 	void *data_buf;
-
-	/* Per-connection bookkeeping for disconnect-time cleanup */
-	struct device_ctx *dev_ctx;
-	int client_idx;
 };
 
 /* Connection context for both TCP and RDMA CM */
@@ -203,8 +199,6 @@ struct app_ctx {
 	bool stats_enabled;
 	bool separate_cq;
 	volatile bool init_done;
-	/* Gate for worker threads to wait until all CM connections are up */
-	volatile bool cm_connections_ready;
 };
 
 #define MAX_CLIENTS 2048
