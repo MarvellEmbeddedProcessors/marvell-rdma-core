@@ -64,7 +64,7 @@ is_queue_full(uint16_t pi, uint16_t ci, uint16_t qmask)
 }
 
 static octep_always_inline bool
-is_queue_empty(uint16_t pi, uint16_t ci)
+is_queue_empty(uint32_t pi, uint32_t ci)
 {
 	return (pi == ci);
 }
@@ -74,19 +74,19 @@ octep_rdma_pts_poll_cq(struct ibv_cq *ibcq, int num_entries, struct ibv_wc *wc)
 {
 	struct octep_rdma_cq *cq = to_octep_rdma_cq(ibcq);
 	struct octep_rdma_cqe *q_base = cq->q_base, *cqe;
-	uint16_t ci, pi, avail;
+	uint32_t ci, pi, avail;
 	uint32_t cq_sz, qmask;
-	uint16_t *pi_dbl;
+	uint32_t *pi_dbl;
 	int i;
 
-	pi_dbl = (uint16_t *)cq->pi_dbl;
+	pi_dbl = (uint32_t *)cq->pi_dbl;
 	cq_sz = cq->depth;
 	qmask = cq->qmask;
 
 	/* Check for entries */
 	pthread_spin_lock(&cq->lock);
 	ci = cq->ci;
-	__atomic_load((uint16_t *)pi_dbl, &pi, __ATOMIC_ACQUIRE);
+	__atomic_load((uint32_t *)pi_dbl, &pi, __ATOMIC_ACQUIRE);
 	if (is_queue_empty(pi, ci)) {
 		pthread_spin_unlock(&cq->lock);
 		return 0;
@@ -109,7 +109,7 @@ octep_rdma_pts_poll_cq(struct ibv_cq *ibcq, int num_entries, struct ibv_wc *wc)
 	}
 	/* Update consumer index */
 	cq->ci = ci;
-	__atomic_store_n((uint16_t *)cq->ci_dbl, ci, __ATOMIC_RELEASE);
+	__atomic_store_n((uint32_t *)cq->ci_dbl, ci, __ATOMIC_RELEASE);
 	pthread_spin_unlock(&cq->lock);
 	return avail;
 }

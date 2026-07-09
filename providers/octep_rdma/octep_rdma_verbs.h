@@ -24,8 +24,8 @@ struct octep_rdma_cq {
 	uint32_t qmask;
 	uint32_t ci;
 	void *q_base;
-	volatile atomic_ushort *pi_dbl;
-	volatile atomic_ushort *ci_dbl;
+	volatile atomic_uint *pi_dbl;
+	volatile atomic_uint *ci_dbl;
 
 	uint32_t cq_size;
 	uint32_t comp_vector;

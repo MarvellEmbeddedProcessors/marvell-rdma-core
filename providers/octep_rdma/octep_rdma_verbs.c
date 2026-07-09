@@ -192,7 +192,7 @@ octep_rdma_create_cq(struct ibv_context *ibv_ctx, int num_cqe, struct ibv_comp_c
 	cq->comp_vector = comp_vector;
 	cq->pi_dbl = (void *)ctx->db_region +
 		     (((cq->id * OCTEP_RDMA_QS_MULTIPLIER) + 2) * ctx->notify_off_multiplier);
-	cq->ci_dbl = cq->pi_dbl + 2;
+	cq->ci_dbl = cq->pi_dbl + 1;
 
 	verbs_debug(verbs_get_ctx(cq->ibcq.context),
 		    "[%s] cq %p cq->q_base 0x%lx size %lx id %d depth %d comp_vector %d\n",
