@@ -132,7 +132,7 @@ octep_rdma_pts_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr, struct ibv
 	ci = atomic_load(rq->ci_dbl);
 
 	while (wr) {
-		if (is_queue_full(pi, ci, rq->qmask)) {
+		if (unlikely(is_queue_full(pi, ci, qmask))) {
 			verbs_err(verbs_get_ctx(ibqp->context), "QP[%d]: RQ overflow, idx %d\n",
 				  qp->id, pi);
 			rv = -ENOMEM;
@@ -145,12 +145,10 @@ octep_rdma_pts_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr, struct ibv
 		rqe->wr_id = wr->wr_id;
 		rqe->num_sge = num_sge;
 
-		/* Copy first SGE */
-		memcpy(rqe->sges0, sg_list, sizeof(struct ibv_sge) * 1);
-		sg_list++;
 		rqe->sges0[0].addr = wr->sg_list[0].addr;
 		rqe->sges0[0].length = wr->sg_list[0].length;
 		rqe->sges0[0].key = wr->sg_list[0].lkey;
+		sg_list++;
 
 		verbs_debug_datapath(verbs_get_ctx(ibqp->context),
 				     "idx %d wr_id %ld rqe %p addr %llx length %d key %x\n", pi,
@@ -183,7 +181,7 @@ octep_rdma_pts_validate_send_wr(struct octep_rdma_qp *qp, struct ibv_send_wr *wr
 	if (wr_list->num_sge > OCTEP_RDMA_MAX_SGE_COUNT)
 		return -EINVAL;
 
-	if (octep_rdma_pts_is_supported_opcode(opcode))
+	if (!octep_rdma_pts_is_supported_opcode(opcode))
 		return -EINVAL;
 
 	return 0;
@@ -218,17 +216,15 @@ octep_rdma_pts_update_sqe(struct octep_rdma_qp *qp, union octep_rdma_sqe *sqe, u
 
 static inline int
 octep_rdma_pts_post_one_send(struct octep_rdma_qp *qp, struct octep_rdma_queue *sq,
-			     struct ibv_send_wr *wr_list)
+			     struct ibv_send_wr *wr_list, uint16_t ci)
 {
 	union octep_rdma_sqe *sqe = NULL;
-	uint16_t depth = sq->depth, qmask = sq->qmask;
+	uint16_t qmask = sq->qmask;
 	struct ibv_sge *sg_list;
 	void *qbuf = sq->qbuf;
 	uint16_t pi = sq->pi;
-	uint16_t ci;
 	uint8_t opcode, cnt;
 	int num_sge = 0;
-	int ret = 0;
 
 #ifdef OCTEP_RDMA_DEBUG
 	int err = 0;
@@ -243,8 +239,7 @@ octep_rdma_pts_post_one_send(struct octep_rdma_qp *qp, struct octep_rdma_queue *
 	sg_list = wr_list->sg_list;
 	num_sge = wr_list->num_sge;
 
-	ci = atomic_load(sq->ci_dbl);
-	if (is_queue_full(pi, ci, qmask)) {
+	if (unlikely(is_queue_full(pi, ci, qmask))) {
 		verbs_err(verbs_get_ctx(qp->ibqp.context), "QP[%d]: SQ overflow, idx %d\n", qp->id,
 			  pi);
 		return -ENOMEM;
@@ -268,7 +263,7 @@ octep_rdma_pts_post_one_send(struct octep_rdma_qp *qp, struct octep_rdma_queue *
 		memcpy(&sqe->sges0[1], sg_list, sizeof(struct ibv_sge) * 1);
 		num_sge--;
 		sg_list++;
-		pi = (pi + 1) & (depth - 1);
+		pi = (pi + 1) & qmask;
 
 		while (num_sge) {
 			sqe = (union octep_rdma_sqe *)qbuf + pi;
@@ -284,7 +279,7 @@ octep_rdma_pts_post_one_send(struct octep_rdma_qp *qp, struct octep_rdma_queue *
 	}
 	/* TODO: unnecessary load/store to sq */
 	sq->pi = pi;
-	return ret;
+	return 0;
 }
 
 int
@@ -293,18 +288,20 @@ octep_rdma_pts_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr_list,
 {
 	struct octep_rdma_qp *qp = to_octep_rdma_qp(ibqp);
 	struct octep_rdma_queue *sq = &qp->sq;
+	uint16_t ci;
 	int ret = 0;
 
-	if (!bad_wr)
+	if (unlikely(!bad_wr))
 		return -EINVAL;
 	*bad_wr = NULL;
 
-	if (!sq->qbuf || !wr_list)
+	if (unlikely(!sq->qbuf || !wr_list))
 		return -EINVAL;
 
 	pthread_spin_lock(&qp->sq_lock);
+	ci = atomic_load(sq->ci_dbl);
 	while (wr_list) {
-		ret = octep_rdma_pts_post_one_send(qp, sq, wr_list);
+		ret = octep_rdma_pts_post_one_send(qp, sq, wr_list, ci);
 		if (ret) {
 			*bad_wr = wr_list;
 			break;
