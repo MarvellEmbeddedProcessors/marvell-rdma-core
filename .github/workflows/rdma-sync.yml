@@ -5,6 +5,7 @@ on:
     types: [closed]
     branches:
       - rdma-core-57.0-devel
+      - nvmeof-rdma-core-release
 
 jobs:
   sync:
