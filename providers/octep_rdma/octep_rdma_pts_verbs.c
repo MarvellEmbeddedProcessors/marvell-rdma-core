@@ -16,8 +16,13 @@
 #include "octep_rdma.h"
 
 static const enum ibv_wr_opcode octep_rdma_pts_supported_opcodes[] = {
-	IBV_WR_SEND,      IBV_WR_SEND_WITH_IMM, IBV_WR_RDMA_WRITE, IBV_WR_RDMA_WRITE_WITH_IMM,
+	IBV_WR_SEND,
+	IBV_WR_SEND_WITH_IMM,
+	IBV_WR_RDMA_WRITE,
+	IBV_WR_RDMA_WRITE_WITH_IMM,
 	IBV_WR_RDMA_READ,
+	IBV_WR_ATOMIC_CMP_AND_SWP,
+	IBV_WR_ATOMIC_FETCH_AND_ADD,
 };
 
 struct verbs_context_ops octep_rdma_pts_ctx_ops = {
@@ -209,6 +214,17 @@ octep_rdma_pts_update_sqe(struct octep_rdma_qp *qp, union octep_rdma_sqe *sqe, u
 		sqe->rdma.remote_addr = wr_list->wr.rdma.remote_addr;
 		sqe->rdma.rkey = wr_list->wr.rdma.rkey;
 		break;
+	case IBV_WR_ATOMIC_CMP_AND_SWP:
+		sqe->rdma.remote_addr = wr_list->wr.atomic.remote_addr;
+		sqe->rdma.rkey = wr_list->wr.atomic.rkey;
+		sqe->atomic.swap = wr_list->wr.atomic.swap;
+		sqe->atomic.compare = wr_list->wr.atomic.compare_add;
+		break;
+	case IBV_WR_ATOMIC_FETCH_AND_ADD:
+		sqe->rdma.remote_addr = wr_list->wr.atomic.remote_addr;
+		sqe->rdma.rkey = wr_list->wr.atomic.rkey;
+		sqe->atomic.swap = wr_list->wr.atomic.compare_add;
+		break;
 	default:
 		break;
 	}
@@ -253,29 +269,41 @@ octep_rdma_pts_post_one_send(struct octep_rdma_qp *qp, struct octep_rdma_queue *
 	sqe->num_sges = num_sge;
 
 	octep_rdma_pts_update_sqe(qp, sqe, opcode, wr_list);
-	/* Copy first SGE */
-	memcpy(sqe->sges0, sg_list, sizeof(struct ibv_sge) * 1);
-	sg_list++;
-	num_sge--;
-
-	/* Copy the rest of the SGEs */
-	if (unlikely(num_sge)) {
-		memcpy(&sqe->sges0[1], sg_list, sizeof(struct ibv_sge) * 1);
-		num_sge--;
-		sg_list++;
+	if (opcode == IBV_WR_ATOMIC_CMP_AND_SWP || opcode == IBV_WR_ATOMIC_FETCH_AND_ADD) {
+		octep_rdma_pts_update_sqe(qp, sqe, opcode, wr_list);
+		/* Atomics has one SGE only*/
+		sqe->num_sges = 1;
+		/* sges0[0] used by atomic fields */
+		sqe->sges0[1].addr = sg_list[0].addr;
+		sqe->sges0[1].length = sg_list[0].length;
+		sqe->sges0[1].key = sg_list[0].lkey;
 		pi = (pi + 1) & qmask;
+	} else {
+		octep_rdma_pts_update_sqe(qp, sqe, opcode, wr_list);
+		/* Copy first SGE */
+		memcpy(sqe->sges0, sg_list, sizeof(struct ibv_sge) * 1);
+		sg_list++;
+		num_sge--;
 
-		while (num_sge) {
-			sqe = (union octep_rdma_sqe *)qbuf + pi;
-			cnt = num_sge > 4 ? 4 : num_sge;
+		/* Copy the rest of the SGEs */
+		if (unlikely(num_sge)) {
+			memcpy(&sqe->sges0[1], sg_list, sizeof(struct ibv_sge) * 1);
+			num_sge--;
+			sg_list++;
+			pi = (pi + 1) & qmask;
 
-			memcpy(sqe->sges1, sg_list, sizeof(struct ibv_sge) * cnt);
-			sg_list += cnt;
-			num_sge -= cnt;
+			while (num_sge) {
+				sqe = (union octep_rdma_sqe *)qbuf + pi;
+				cnt = num_sge > 4 ? 4 : num_sge;
+
+				memcpy(sqe->sges1, sg_list, sizeof(struct ibv_sge) * cnt);
+				sg_list += cnt;
+				num_sge -= cnt;
+				pi = (pi + 1) & qmask;
+			}
+		} else {
 			pi = (pi + 1) & qmask;
 		}
-	} else {
-		pi = (pi + 1) & qmask;
 	}
 	/* TODO: unnecessary load/store to sq */
 	sq->pi = pi;

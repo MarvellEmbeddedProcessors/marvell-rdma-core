@@ -190,8 +190,15 @@ union octep_rdma_sqe {
 				uint32_t qkey;
 			} ud;
 		};
-		/* WORD 4-7 */
-		struct octep_rdma_sge sges0[2];
+		union {
+			/* WORD 4-7 */
+			struct octep_rdma_sge sges0[2];
+			struct {
+				uint64_t swap;
+				uint64_t compare;
+				uint64_t rsvd[2];
+			} atomic;
+		};
 	};
 	/* WORD 0-7 */
 	struct octep_rdma_sge sges1[4];
